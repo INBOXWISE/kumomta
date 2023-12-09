@@ -4,6 +4,8 @@ local kumo = require 'kumo'
 local TEST_DIR = os.getenv 'KUMOD_TEST_DIR'
 
 kumo.on('init', function()
+  kumo.configure_accounting_db_path ':memory:'
+
   kumo.start_esmtp_listener {
     listen = '127.0.0.1:0',
     relay_hosts = { '0.0.0.0/0' },
@@ -11,7 +13,7 @@ kumo.on('init', function()
 
   kumo.configure_local_logs {
     log_dir = TEST_DIR .. '/logs',
-    max_segement_duration = '1s',
+    max_segment_duration = '1s',
   }
 
   kumo.define_spool {

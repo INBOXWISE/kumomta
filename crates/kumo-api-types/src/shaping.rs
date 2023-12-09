@@ -269,9 +269,11 @@ impl ShapingInner {
     pub fn match_rules(&self, record: &JsonLogRecord, domain: &str, site_name: &str) -> Vec<Rule> {
         let mut result = vec![];
         let response = record.response.to_single_line();
+        tracing::trace!("Consider rules for {response}");
 
         if let Some(default) = self.by_domain.get("default") {
             for rule in &default.automation {
+                tracing::trace!("Consider \"default\" rule {rule:?} for {response}");
                 if rule.matches(&response) {
                     // For automation under `default`, we always
                     // assume that mx_rollup should be true.
@@ -287,6 +289,7 @@ impl ShapingInner {
         // Then site config
         if let Some(by_site) = self.by_site.get(site_name) {
             for rule in &by_site.automation {
+                tracing::trace!("Consider \"{site_name}\" rule {rule:?} for {response}");
                 if rule.matches(&response) {
                     result.push(rule.clone_and_set_rollup());
                 }
@@ -296,6 +299,7 @@ impl ShapingInner {
         // Then domain config
         if let Some(by_domain) = self.by_domain.get(domain) {
             for rule in &by_domain.automation {
+                tracing::trace!("Consider \"{domain}\" rule {rule:?} for {response}");
                 if rule.matches(&response) {
                     result.push(rule.clone());
                 }
@@ -617,6 +621,8 @@ MergedEntry {
     params: EgressPathConfig {
         connection_limit: 10,
         enable_tls: Opportunistic,
+        enable_mta_sts: true,
+        enable_dane: false,
         client_timeouts: SmtpClientTimeouts {
             connect_timeout: 60s,
             ehlo_timeout: 300s,
@@ -704,6 +710,8 @@ MergedEntry {
     params: EgressPathConfig {
         connection_limit: 3,
         enable_tls: Opportunistic,
+        enable_mta_sts: true,
+        enable_dane: false,
         client_timeouts: SmtpClientTimeouts {
             connect_timeout: 60s,
             ehlo_timeout: 300s,
@@ -778,6 +786,8 @@ MergedEntry {
         "my source name": EgressPathConfig {
             connection_limit: 5,
             enable_tls: Opportunistic,
+            enable_mta_sts: true,
+            enable_dane: false,
             client_timeouts: SmtpClientTimeouts {
                 connect_timeout: 60s,
                 ehlo_timeout: 300s,
@@ -859,6 +869,8 @@ MergedEntry {
     params: EgressPathConfig {
         connection_limit: 10,
         enable_tls: Opportunistic,
+        enable_mta_sts: true,
+        enable_dane: false,
         client_timeouts: SmtpClientTimeouts {
             connect_timeout: 60s,
             ehlo_timeout: 300s,

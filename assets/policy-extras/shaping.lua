@@ -56,10 +56,14 @@ local function should_enq(publish, msg, hook_name)
   local params = publish[hook_name]
   if not params then
     -- User defined log hook that is not part of shaping.lua
-    return false
+    return
   end
 
   local log_record = msg:get_meta 'log_record'
+  -- avoid overlap with other logs
+  if log_record.reception_protocol == 'LogRecord' then
+    return false
+  end
 
   -- We only want to log if the event isn't one of our
   -- publishing events
@@ -121,6 +125,10 @@ end
 local shaper = shaping:setup_with_automation {
   publish = {"http://10.0.0.1:8008"},
   subscribe = {"http://10.0.0.1:8008"},
+  -- this needs to list any files that hold your custom shaping rules; should match
+  -- the additional files beyond /opt/kumomta/share/policy-extras/shaping.toml in your
+  -- tsa config
+  extra_files = { '/opt/kumomta/etc/policy/shaping.toml' },
 }
 
 kumo.on('init', function()
@@ -128,15 +136,6 @@ kumo.on('init', function()
 end)
 
 kumo.on('get_egress_path_config', shaper.get_egress_path_config)
-kumo.on('should_enqueue_log_record', shaper.should_enqueue_log_record)
-kumo.on('get_queue_config', function(domain, tenant, campaign)
-  local cfg = shaper.get_queue_config(domain, tenant, campaign)
-  if cfg then
-    return cfg
-  end
-
-  -- Do your normal queue config handling here
-end)
 ]]
 function mod:setup_with_automation(options)
   local cached_load_data = kumo.memoize(load_shaping_data, {
@@ -219,14 +218,42 @@ function mod:setup_with_automation(options)
     return kumo.make_egress_path(params)
   end
 
+  -- Setup the webhook publisher to the TSA daemon.
+  -- Since each destination has a unique domain name,
+  -- the implementation of get_queue_cfg can simply
+  -- match that name and return the full configuration
+  -- for it; there is no need for user config to need
+  -- to mutate it so we can register a handler here without
+  -- exposing the handler to the user's config, make things
+  -- just a little simpler for them.
+  kumo.on(
+    'get_queue_config',
+    function(domain, tenant, campaign, routing_domain)
+      return get_queue_cfg(publish, domain, tenant, campaign)
+    end
+  )
+
+  kumo.on('should_enqueue_log_record', function(msg, hook_name)
+    return should_enq(publish, msg, hook_name)
+  end)
+
   return {
     get_egress_path_config = get_egress_path_config,
     should_enqueue_log_record = function(msg, hook_name)
-      return should_enq(publish, msg, hook_name)
+      -- deprecated: no longer needed as we register a should_enqueue_log_record
+      -- handler above.
+      -- This is preserved for backwards compatibility; when
+      -- called, it does nothing.
+      -- TODO: remove me after next release.
+      return
     end,
     setup_publish = setup_publish,
-    get_queue_config = function(domain, tenant, campaign)
-      return get_queue_cfg(publish, domain, tenant, campaign)
+    get_queue_config = function(domain, tenant, campaign, routing_domain)
+      -- deprecated: no longer needed as we register a get_queue_config
+      -- handler above.
+      -- This is preserved for backwards compatibility; when
+      -- called, it does nothing.
+      -- TODO: remove me after next release.
     end,
   }
 end

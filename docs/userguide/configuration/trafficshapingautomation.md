@@ -46,16 +46,19 @@ kumo.on('tsa_load_shaping_data', function()
     '/opt/kumomta/share/policy-extras/shaping.toml',
 
     -- and maybe you have your own rules
-    '/opt/kumomta/policy/shaping.toml',
+    '/opt/kumomta/etc/policy/shaping.toml',
   }
   return shaping
 end)
 ```
 
-!!!note
-    Do not edit the `/opt/kumomta/share/policy-extras/shaping.toml` as it is overwritten when upgrading KumoMTA. Instead, create the `/opt/kumomta/policy/shaping.toml` file as listed above and populate it with your own override rules.
+!!!warning
+    Do not edit the `/opt/kumomta/share/policy-extras/shaping.toml` as it is overwritten when upgrading KumoMTA. Instead, create the `/opt/kumomta/etc/policy/shaping.toml` file as listed above and populate it with your own override rules.
 
 ## Changes to the `init.lua` File
+
+!!!note
+    It's easiest to reference the [Example Config](./example.md) to see how the complete configuration looks.
 
 The server's `init.lua` file will require modifications to enable it to be used with TSA.
 
@@ -67,10 +70,11 @@ local shaping = require 'policy-extras.shaping'
 local shaper = shaping:setup_with_automation {
   publish = { 'http://127.0.0.1:8008' },
   subscribe = { 'http://127.0.0.1:8008' },
+  extra_files = { '/opt/kumomta/etc/policy/shaping.toml' },
 }
 ```
 
-This section enabled communication with the TSA daemon. The publish and subscribe URLs correspond to the TSA daemon's HTTP listener endpoint defined in its tsa_init.lua.  For a single node deployment the values shown here are sufficient.  You may list multiple publish and/or subscribe endpoints to publish to multiple hosts and read shaping configuration from multiple hosts, respectively.
+This section enabled communication with the TSA daemon. The publish and subscribe URLs correspond to the TSA daemon's HTTP listener endpoint defined in its tsa_init.lua.  For a single node deployment the values shown here are sufficient.  You may list multiple publish and/or subscribe endpoints to publish to multiple hosts and read shaping configuration from multiple hosts, respectively. In addition, while the `setup_with_automation` call is aware of the community shaping rules file, any custom file must be identified in the `extra_files` directive as seen in the example above.
 
 Next, the following should be added within the `kumo.on('init', function()` block:
 
@@ -86,16 +90,6 @@ Finally, the following must be added outside the init event to enable the TSA ma
 ```lua
 -- Attach various hooks to the shaper
 kumo.on('get_egress_path_config', shaper.get_egress_path_config)
-kumo.on('should_enqueue_log_record', shaper.should_enqueue_log_record)
-kumo.on('get_queue_config', function(domain, tenant, campaign)
-  local cfg = shaper.get_queue_config(domain, tenant, campaign)
-  if cfg then
-    return cfg
-  end
-
-  -- Do your normal queue config handling here
-  return kumo.make_queue_config {}
-end)
 ```
 
 ## Changes to the `shaping.toml` File
@@ -140,3 +134,13 @@ $ curl -s 'http://localhost:8008/get_config_v1/shaping.toml'
 ```
 
 This call returns the current set of shaping rules in the same format as shaping.toml, the example is of an empty set.
+
+## Debugging Tips
+If the tsa-deamon does not appear to be working, you can check to see if it is running with 'sudo systemctl status kumo-tsa-daemon' which should return a message that includes "active (running)".  If not you can stop and start it in a similar way.
+
+```bash
+sudo systemctl stop kumo-tsa-daemon
+sudo systemctl start kumo-tsa-daemon
+```
+
+Data for the TSA daemon is just like any other message in KumoMTA and will follow the same retry rules. The default is to retry in 20 minutes with exponential fallback.  If desired, this (or any other) scheduled queue can be customized with the [get_queue_config](https://docs.kumomta.com/reference/events/get_queue_config/) hook.

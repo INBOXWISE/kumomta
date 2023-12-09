@@ -80,7 +80,7 @@ kumo.on('make.webhook', function(domain, tenant, campaign)
   return connection
 end)
 
-kumo.on('get_queue_config', function(domain, tenant, campaign)
+kumo.on('get_queue_config', function(domain, tenant, campaign, routing_domain)
   if domain == 'webhook' then
     -- Use the `make.webhook` event to handle delivery
     -- of webhook log records
@@ -95,3 +95,14 @@ kumo.on('get_queue_config', function(domain, tenant, campaign)
   return kumo.make_queue_config {}
 end)
 ```
+
+{{since('2023.11.28-b5252a41', indent=True)}}
+    It is now possible to use `kumo.on` to register multiple handlers for
+    this event.  The handlers will be called in the order that they were
+    registered.  If a handler returns `nil` then the next handler will be
+    called. Conversely, if a handler returns either `true` or `false`,
+    its return value is taken as the definitive outcome and no further handlers
+    will be called.
+
+    This behavior is intended to make it easier to compose multiple helpers
+    or lua modules together.

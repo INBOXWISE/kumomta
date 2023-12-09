@@ -12,11 +12,12 @@ The install instructions for supported platforms are shown below. If your platfo
         Note that Red Hat full support for RHEL 7 [ended in August
         2019](https://access.redhat.com/support/policy/updates/errata#Retired_Life_Cycle_Dates)
         and CentOS 7 full support [ended in August
-        2020](https://wiki.centos.org/About/Product).
+        2020](https://wiki.centos.org/About/Product). We ended automated builds for RHEL 7 with the [2023.08.22-4d895015](../../changelog/2023.08.22-4d895015.md) release.
 
         We recommend upgrading to a newer OS as soon as possible.
 
     ```console
+    $ sudo yum install -y yum-utils
     $ sudo yum-config-manager --add-repo=\
         https://openrepo.kumomta.com/files/kumomta-centos.repo
     $ sudo yum install kumomta
@@ -50,6 +51,20 @@ The install instructions for supported platforms are shown below. If your platfo
     $ sudo apt update
     $ sudo apt install -y kumomta
     ```
+
+=== "Amazon Linux 2"
+
+    !!! note
+        There are no stable versions available for this platform,
+        so if you want a pre-built binary you could consider
+        installing a `-dev` build, see instructions below
+
+=== "Amazon Linux 2023"
+
+    !!! note
+        There are no stable versions available for this platform,
+        so if you want a pre-built binary you could consider
+        installing a `-dev` build, see instructions below
 
 ## Installing from a Dev Repository
 
@@ -69,6 +84,7 @@ If you want to test the latest additions and improvements to KumoMTA, you can in
         We recommend upgrading to a newer OS as soon as possible.
 
     ```console
+    $ sudo yum install -y yum-utils
     $ sudo yum-config-manager --add-repo=\
         https://openrepo.kumomta.com/files/kumomta-centos.repo
     $ sudo yum install kumomta-dev
@@ -102,6 +118,25 @@ If you want to test the latest additions and improvements to KumoMTA, you can in
     $ sudo apt update
     $ sudo apt install -y kumomta-dev
     ```
+
+=== "Amazon Linux 2"
+
+    ```console
+    $ sudo yum install -y yum-utils
+    $ sudo yum-config-manager --add-repo=\
+        https://openrepo.kumomta.com/files/kumomta-amazon.repo
+    $ sudo yum install kumomta-dev
+    ```
+
+=== "Amazon Linux 2023"
+
+    ```console
+    $ sudo dnf -y install dnf-plugins-core
+    $ sudo dnf config-manager --add-repo \
+        https://openrepo.kumomta.com/files/kumomta-amazon2023.repo
+    $ sudo yum install kumomta-dev
+    ```
+
 
 ## The Initial Config File
 

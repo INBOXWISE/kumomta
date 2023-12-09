@@ -16,24 +16,18 @@ class Page(object):
         self.filename = filename
         self.children = children or []
 
-    def render(self, output, depth=0, mode="mdbook"):
+    def render(self, output, depth=0):
         indent = "  " * depth
         bullet = "- " if depth > 0 else ""
-        if mode == "mdbook":
-            if self.filename:
-                output.write(f"{indent}{bullet}[{self.title}]({self.filename})\n")
-        elif mode == "mkdocs":
-            if depth > 0:
-                if len(self.children) == 0:
-                    output.write(f'{indent}{bullet}"{self.title}": {self.filename}\n')
-                else:
-                    output.write(f'{indent}{bullet}"{self.title}":\n')
-                    if self.filename:
-                        output.write(
-                            f'{indent}  {bullet}"{self.title}": {self.filename}\n'
-                        )
+        if depth > 0:
+            if len(self.children) == 0:
+                output.write(f'{indent}{bullet}"{self.title}": {self.filename}\n')
+            else:
+                output.write(f'{indent}{bullet}"{self.title}":\n')
+                if self.filename:
+                    output.write(f'{indent}  {bullet}"{self.title}": {self.filename}\n')
         for kid in self.children:
-            kid.render(output, depth + 1, mode)
+            kid.render(output, depth + 1)
 
 
 class Gen(object):
@@ -46,7 +40,7 @@ class Gen(object):
         self.extract_title = extract_title
         self.reverse = reverse
 
-    def render(self, output, depth=0, mode="mdbook"):
+    def render(self, output, depth=0):
         names = sorted(glob.glob(f"{self.dirname}/*.md"), reverse=self.reverse)
         children = []
         for filename in names:
@@ -62,7 +56,7 @@ class Gen(object):
 
         index_filename = f"{self.dirname}/index.md"
         index_page = Page(self.title, index_filename, children=children)
-        index_page.render(output, depth, mode)
+        index_page.render(output, depth)
         with open(index_filename, "w") as idx:
             if self.index:
                 idx.write(self.index)
@@ -78,21 +72,57 @@ class Gen(object):
                 idx.write(f"  - [{page.title}]({os.path.basename(page.filename)})\n")
 
 
+class RustDoc(object):
+    """autogenerate an index page from the contents of a directory"""
+
+    def __init__(self, title, dirname):
+        self.title = title
+        self.dirname = dirname
+
+    def render(self, output, depth=0):
+        names = sorted(glob.glob(f"{self.dirname}/*/index.html"))
+        children = []
+        for filename in names:
+            crate_name = os.path.dirname(filename)
+            title = os.path.basename(crate_name)
+
+            children.append(Page(title, filename))
+
+        index_filename = f"{self.dirname}/index.md"
+        index_page = Page(self.title, index_filename, children=children)
+        index_page.render(output, depth)
+        with open(index_filename, "w") as idx:
+            idx.write(
+                """
+This section contains automatically generated documentation from
+the internal Rust code.  It is included in here to aid those
+hacking on the internals.
+
+There are no stability guarantees with this API: it may change
+without any regard for backward compatibility.
+
+The following crates are part of the KumoMTA workspace:
+
+"""
+            )
+            for page in children:
+                idx.write(f"  - [{page.title}]({page.title}/index.html)\n")
+
+
 TOC = [
     Page(
         "Tutorial",
         None,
         children=[
-            Page("KumoMTA Day 1", "tutorial/kumomta_day_1.md"),
+            Page("Quickstart Tutorial", "tutorial/quickstart.md"),
             Page("Server Environment", "tutorial/server_environment.md"),
             Page("System Preparation", "tutorial/system_preparation.md"),
-            Page("Install It", "tutorial/install_it.md"),
-            Page("Your First Email", "tutorial/your_first_email.md"),
+            Page("Installing KumoMTA", "tutorial/installing_kumomta.md"),
+            Page("Configuring KumoMTA", "tutorial/configuring_kumomta.md"),
+            Page("Starting KumoMTA", "tutorial/starting_kumomta.md"),
+            Page("Testing KumoMTA", "tutorial/testing_kumomta.md"),
             Page("Checking Logs", "tutorial/checking_logs.md"),
-            Page("Performance tuning", "tutorial/performance.md"),
-            Page("Lua Resources", "tutorial/lua_resources.md"),
-            Page("How messages flow", "tutorial/how_it_works.md"),
-            Page("Working with Vault", "tutorial/using_vault.md"),
+            Page("Next Steps", "tutorial/next_steps.md"),
         ],
     ),
     Page(
@@ -105,12 +135,12 @@ TOC = [
                 children=[
                     Page("Preface and Legal Notices", "userguide/general/preface.md"),
                     Page("About This Manual", "userguide/general/about.md"),
-                    Page(
-                        "How to Report Bugs or Get Help", "userguide/general/report.md"
-                    ),
+                    Page("How to Report Bugs", "userguide/general/report.md"),
+                    Page("How to Get Help", "userguide/general/get_help.md"),
                     Page("Credits", "userguide/general/credits.md"),
                     Page("History", "userguide/general/history.md"),
                     Page("Architecture", "userguide/general/architecture.md"),
+                    Page("Lua Fundamentals", "userguide/general/lua.md"),
                 ],
             ),
             Page(
@@ -143,6 +173,10 @@ TOC = [
                 children=[
                     Page(
                         "Configuration Concepts", "userguide/configuration/concepts.md"
+                    ),
+                    Page(
+                        "Lua Policy Helpers",
+                        "userguide/configuration/policy_helpers.md",
                     ),
                     Page("Example Server Policy", "userguide/configuration/example.md"),
                     Page("Configuring Spooling", "userguide/configuration/spool.md"),
@@ -193,6 +227,10 @@ TOC = [
                     Page("Starting KumoMTA", "userguide/operation/starting.md"),
                     Page("Getting Server Status", "userguide/operation/status.md"),
                     Page(
+                        "Troubleshooting KumoMTA",
+                        "userguide/operation/troubleshooting.md",
+                    ),
+                    Page(
                         "Using the kcli Command-Line Client",
                         "userguide/operation/kcli.md",
                     ),
@@ -208,15 +246,7 @@ TOC = [
                         "Routing Messages Via Proxy Servers",
                         "userguide/operation/proxy.md",
                     ),
-                    Page(
-                        "Delivering Messages Using SMTP Auth",
-                        "userguide/operation/smtpauth.md",
-                    ),
                     Page("Viewing Logs", "userguide/operation/logs.md"),
-                    Page(
-                        "Publishing Log Events Via Webhooks",
-                        "userguide/operation/webhooks.md",
-                    ),
                     Page("Canceling Queued Messages", "userguide/operation/cancel.md"),
                     Page("Performance Tuning", "userguide/operation/performance.md"),
                 ],
@@ -225,15 +255,41 @@ TOC = [
                 "Policy",
                 "userguide/policy/index.md",
                 children=[
-                    Page("Custom Destination Routing", "userguide/policy/routing.md"),
                     Page(
-                        "Advanced Tenant to Pool Mapping",
-                        "userguide/policy/tenantpool.md",
+                        "Checking Inbound SMTP Authentication",
+                        "userguide/policy/inbound_auth.md",
                     ),
+                    Page(
+                        "Delivering Messages Using SMTP Auth",
+                        "userguide/operation/outbound_auth.md",
+                    ),
+                    Page("Custom Destination Routing", "userguide/policy/routing.md"),
                     Page(
                         "Routing Messages via HTTP Request", "userguide/policy/http.md"
                     ),
                     Page("Routing Messages via AMQP", "userguide/policy/amqp.md"),
+                    Page(
+                        "Storing Secrets in Hashicorp Vault",
+                        "userguide/policy/hashicorp_vault.md",
+                    ),
+                    Page(
+                        "Publishing Log Events Via Webhooks",
+                        "userguide/operation/webhooks.md",
+                    ),
+                ],
+            ),
+            Page(
+                "Integrations",
+                "userguide/integrations/index.md",
+                children=[
+                    Page(
+                        "Ongage",
+                        "userguide/integrations/ongage.md",
+                    ),
+                    Page(
+                        "Prometheus",
+                        "userguide/integrations/prometheus.md",
+                    ),
                 ],
             ),
         ],
@@ -280,6 +336,10 @@ TOC = [
                 "reference/kumo.http",
             ),
             Gen(
+                "module: kumo.regex_set_map",
+                "reference/kumo.regex_set_map",
+            ),
+            Gen(
                 "module: kumo.secrets",
                 "reference/kumo.secrets",
             ),
@@ -308,6 +368,10 @@ TOC = [
                 "reference/addressheader",
             ),
             Page(
+                "object: authenticationresult",
+                "reference/authenticationresult.md",
+            ),
+            Page(
                 "object: connectionmeta",
                 "reference/connectionmeta.md",
             ),
@@ -323,7 +387,12 @@ TOC = [
                 "events",
                 "reference/events",
             ),
+            Page("HTTP API Explorer", "reference/rapidoc.md"),
             Gen("HTTP API", "reference/http", extract_title=True),
+            RustDoc(
+                "Internal Rust API",
+                "rustapi",
+            ),
         ],
     ),
     Gen("Changelog", "changelog", extract_title=True, reverse=True),
@@ -336,10 +405,4 @@ with open("../mkdocs.yml", "w") as f:
     f.write("INHERIT: mkdocs-base.yml\n")
     f.write("nav:\n")
     for page in TOC:
-        page.render(f, depth=1, mode="mkdocs")
-
-with open("SUMMARY.md", "w") as f:
-    f.write("<!-- this is auto-generated by docs/generate-toc.py, do not edit -->\n")
-    f.write("[Home](index.md)\n")
-    for page in TOC:
-        page.render(f, depth=1, mode="mdbook")
+        page.render(f, depth=1)

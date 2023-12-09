@@ -1,4 +1,10 @@
 use crate::{AsyncReadAndWrite, BoxedAsyncReadAndWrite, Command, Domain, ForwardPath, ReversePath};
+use hickory_proto::rr::rdata::tlsa::{CertUsage, Matching, Selector};
+use hickory_proto::rr::rdata::TLSA;
+use memchr::memmem::Finder;
+use once_cell::sync::Lazy;
+use openssl::ssl::{DaneMatchType, DaneSelector, DaneUsage};
+use openssl::x509::{X509Ref, X509};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -45,6 +51,19 @@ pub enum ClientError {
     },
     #[error("Timed Out sending message payload data")]
     TimeOutData,
+    #[error("SSL Error: {0}")]
+    SslErrorStack(#[from] openssl::error::ErrorStack),
+    #[error("SSL Error: {0}")]
+    SslError(#[from] openssl::ssl::Error),
+    #[error("No usable DANE TLSA records for {hostname}: {tlsa:?}")]
+    NoUsableDaneTlsa { hostname: String, tlsa: Vec<TLSA> },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TlsOptions {
+    pub insecure: bool,
+    pub alt_name: Option<String>,
+    pub dane_tlsa: Vec<TLSA>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +243,8 @@ impl SmtpClient {
         timeouts: SmtpClientTimeouts,
     ) -> std::io::Result<Self> {
         let stream = TcpStream::connect(addr.clone()).await?;
+        // No need for Nagle with SMTP request/response
+        stream.set_nodelay(true)?;
         Ok(Self::with_stream(stream, addr.to_string(), timeouts))
     }
 
@@ -396,8 +417,8 @@ impl SmtpClient {
             let line = cmd.encode();
             tracing::trace!(
                 "send->{}: {}{line}",
+                self.hostname,
                 if pipeline { "(PIPELINE) " } else { "" },
-                self.hostname
             );
             match self.socket.as_mut() {
                 Some(socket) => {
@@ -506,41 +527,97 @@ impl SmtpClient {
     /// On completion, return an option that will be:
     /// * Some(handshake_error) - if the handshake failed
     /// * None - if the handshake succeeded
-    pub async fn starttls(&mut self, insecure: bool) -> Result<Option<String>, ClientError> {
+    pub async fn starttls(&mut self, options: TlsOptions) -> Result<TlsStatus, ClientError> {
         let resp = self.send_command(&Command::StartTls).await?;
         if resp.code != 220 {
             return Err(ClientError::Rejected(resp));
         }
 
-        let connector = build_tls_connector(insecure);
         let mut handshake_error = None;
+        let mut tls_info = TlsInformation::default();
 
-        let server_name = match IpAddr::from_str(self.hostname.as_str()) {
-            Ok(ip) => ServerName::IpAddress(ip),
-            Err(_) => ServerName::try_from(self.hostname.as_str())
-                .map_err(|_| ClientError::InvalidDnsName(self.hostname.clone()))?,
-        };
-
-        let stream: BoxedAsyncReadAndWrite = match connector
-            .connect(
-                server_name,
+        let stream: BoxedAsyncReadAndWrite = if !options.dane_tlsa.is_empty() {
+            let connector = build_dane_connector(&options, &self.hostname)?;
+            let ssl = connector.into_ssl(self.hostname.as_str())?;
+            let mut ssl_stream = tokio_openssl::SslStream::new(
+                ssl,
                 match self.socket.take() {
                     Some(s) => s,
                     None => return Err(ClientError::NotConnected),
                 },
-            )
-            .into_fallible()
-            .await
-        {
-            Ok(stream) => Box::new(stream),
-            Err((err, stream)) => {
+            )?;
+
+            if let Err(err) = std::pin::Pin::new(&mut ssl_stream).connect().await {
                 handshake_error.replace(format!("{err:#}"));
-                stream
+            }
+
+            tls_info.cipher = match ssl_stream.ssl().current_cipher() {
+                Some(cipher) => cipher.standard_name().unwrap_or(cipher.name()).to_string(),
+                None => String::new(),
+            };
+            tls_info.protocol_version = ssl_stream.ssl().version_str().to_string();
+
+            if let Some(cert) = ssl_stream.ssl().peer_certificate() {
+                tls_info.subject_name = subject_name(&cert);
+            }
+            if let Ok(authority) = ssl_stream.ssl().dane_authority() {
+                if let Some(cert) = &authority.cert {
+                    tls_info.subject_name = subject_name(cert);
+                }
+            }
+
+            Box::new(ssl_stream)
+        } else {
+            let connector = build_tls_connector(options.insecure);
+            let server_name = match IpAddr::from_str(self.hostname.as_str()) {
+                Ok(ip) => ServerName::IpAddress(ip),
+                Err(_) => ServerName::try_from(self.hostname.as_str())
+                    .map_err(|_| ClientError::InvalidDnsName(self.hostname.clone()))?,
+            };
+
+            match connector
+                .connect(
+                    server_name,
+                    match self.socket.take() {
+                        Some(s) => s,
+                        None => return Err(ClientError::NotConnected),
+                    },
+                )
+                .into_fallible()
+                .await
+            {
+                Ok(stream) => {
+                    let (_, conn) = stream.get_ref();
+                    tls_info.cipher = match conn.negotiated_cipher_suite() {
+                        Some(suite) => suite.suite().as_str().unwrap_or("UNKNOWN").to_string(),
+                        None => String::new(),
+                    };
+                    tls_info.protocol_version = match conn.protocol_version() {
+                        Some(version) => version.as_str().unwrap_or("UNKNOWN").to_string(),
+                        None => String::new(),
+                    };
+
+                    if let Some(certs) = conn.peer_certificates() {
+                        let peer_cert = &certs[0];
+                        if let Ok(cert) = X509::from_der(peer_cert.as_ref()) {
+                            tls_info.subject_name = subject_name(&cert);
+                        }
+                    }
+
+                    Box::new(stream)
+                }
+                Err((err, stream)) => {
+                    handshake_error.replace(format!("{err:#}"));
+                    stream
+                }
             }
         };
 
         self.socket.replace(stream);
-        Ok(handshake_error)
+        Ok(match handshake_error {
+            Some(error) => TlsStatus::FailedHandshake(error),
+            None => TlsStatus::Info(tls_info),
+        })
     }
 
     pub async fn send_mail<B: AsRef<[u8]>, SENDER: Into<ReversePath>, RECIP: Into<ForwardPath>>(
@@ -590,53 +667,36 @@ impl SmtpClient {
             return Err(ClientError::Rejected(data_resp));
         }
 
-        let mut needs_stuffing = false;
         let data: &[u8] = data.as_ref();
+        let stuffed;
 
-        for line in data.split(|&b| b == b'\n') {
-            if line.starts_with(b".") {
-                needs_stuffing = true;
-                break;
+        let data = match apply_dot_stuffing(data) {
+            Some(d) => {
+                stuffed = d;
+                &stuffed
             }
-        }
-
-        if needs_stuffing {
-            let mut stuffed = vec![];
-            for line in data.split(|&b| b == b'\n') {
-                if line.starts_with(b".") {
-                    stuffed.push(b'.');
-                }
-                stuffed.extend_from_slice(line);
-            }
-            match self.socket.as_mut() {
-                Some(sock) => match timeout(
-                    Command::Data.client_timeout_request(&self.timeouts),
-                    sock.write_all(&stuffed),
-                )
-                .await
-                {
-                    Ok(result) => result.map_err(|_| ClientError::NotConnected)?,
-                    Err(_) => return Err(ClientError::TimeOutData),
-                },
-                None => return Err(ClientError::NotConnected),
-            }
-        } else {
-            match self.socket.as_mut() {
-                Some(sock) => match timeout(
-                    Command::Data.client_timeout_request(&self.timeouts),
-                    sock.write_all(data),
-                )
-                .await
-                {
-                    Ok(result) => result.map_err(|_| ClientError::NotConnected)?,
-                    Err(_) => return Err(ClientError::TimeOutData),
-                },
-                None => return Err(ClientError::NotConnected),
-            }
-        }
-
+            None => data,
+        };
         let needs_newline = data.last().map(|&b| b != b'\n').unwrap_or(true);
+
+        tracing::trace!("message data is {} bytes", data.len());
+
+        match self.socket.as_mut() {
+            Some(sock) => match timeout(
+                Command::Data.client_timeout_request(&self.timeouts),
+                sock.write_all(data),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(|_| ClientError::NotConnected)?,
+                Err(_) => return Err(ClientError::TimeOutData),
+            },
+            None => return Err(ClientError::NotConnected),
+        }
+
         let marker = if needs_newline { "\r\n.\r\n" } else { ".\r\n" };
+
+        tracing::trace!("send->{}: {}", self.hostname, marker.escape_debug());
 
         match self.socket.as_mut() {
             Some(sock) => match timeout(
@@ -666,6 +726,19 @@ impl SmtpClient {
 
         Ok(resp)
     }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
+pub enum TlsStatus {
+    FailedHandshake(String),
+    Info(TlsInformation),
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize, Clone)]
+pub struct TlsInformation {
+    pub cipher: String,
+    pub protocol_version: String,
+    pub subject_name: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Copy, Hash)]
@@ -760,6 +833,68 @@ fn parse_response_line(line: &str) -> Result<ResponseLine, ClientError> {
     }
 }
 
+pub fn build_dane_connector(
+    options: &TlsOptions,
+    hostname: &str,
+) -> Result<openssl::ssl::ConnectConfiguration, ClientError> {
+    tracing::trace!("build_dane_connector for {hostname}");
+    let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())?;
+
+    if options.insecure {
+        builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
+    }
+
+    builder.dane_enable()?;
+    builder.set_no_dane_ee_namechecks();
+
+    let connector = builder.build();
+
+    let mut config = connector.configure()?;
+
+    config.dane_enable(hostname)?;
+    let mut any_usable = false;
+    for tlsa in &options.dane_tlsa {
+        let usable = config.dane_tlsa_add(
+            match tlsa.cert_usage() {
+                CertUsage::CA => DaneUsage::PKIX_TA,
+                CertUsage::Service => DaneUsage::PKIX_EE,
+                CertUsage::TrustAnchor => DaneUsage::DANE_TA,
+                CertUsage::DomainIssued => DaneUsage::DANE_EE,
+                CertUsage::Unassigned(n) => DaneUsage::from_raw(n),
+                CertUsage::Private => DaneUsage::PRIV_CERT,
+            },
+            match tlsa.selector() {
+                Selector::Full => DaneSelector::CERT,
+                Selector::Spki => DaneSelector::SPKI,
+                Selector::Unassigned(n) => DaneSelector::from_raw(n),
+                Selector::Private => DaneSelector::PRIV_SEL,
+            },
+            match tlsa.matching() {
+                Matching::Raw => DaneMatchType::FULL,
+                Matching::Sha256 => DaneMatchType::SHA2_256,
+                Matching::Sha512 => DaneMatchType::SHA2_512,
+                Matching::Unassigned(n) => DaneMatchType::from_raw(n),
+                Matching::Private => DaneMatchType::PRIV_MATCH,
+            },
+            tlsa.cert_data(),
+        )?;
+
+        tracing::trace!("build_dane_connector usable={usable} {tlsa:?}");
+        if usable {
+            any_usable = true;
+        }
+    }
+
+    if !any_usable {
+        return Err(ClientError::NoUsableDaneTlsa {
+            hostname: hostname.to_string(),
+            tlsa: options.dane_tlsa.clone(),
+        });
+    }
+
+    Ok(config)
+}
+
 pub fn build_tls_connector(insecure: bool) -> TlsConnector {
     let config = ClientConfig::builder().with_safe_defaults();
 
@@ -799,9 +934,59 @@ pub fn build_tls_connector(insecure: bool) -> TlsConnector {
     TlsConnector::from(Arc::new(config))
 }
 
+fn apply_dot_stuffing(data: &[u8]) -> Option<Vec<u8>> {
+    static LFDOT: Lazy<Finder> = Lazy::new(|| memchr::memmem::Finder::new("\n."));
+
+    if !data.starts_with(b".") && LFDOT.find(&data).is_none() {
+        return None;
+    }
+
+    let mut stuffed = vec![];
+    if data.starts_with(b".") {
+        stuffed.push(b'.');
+    }
+    let mut last_idx = 0;
+    for i in LFDOT.find_iter(&data) {
+        stuffed.extend_from_slice(&data[last_idx..=i]);
+        stuffed.push(b'.');
+        last_idx = i + 1;
+    }
+    stuffed.extend_from_slice(&data[last_idx..]);
+    Some(stuffed)
+}
+
+/// Extracts the object=name pairs of the subject name from a cert.
+/// eg:
+/// ```norun
+/// ["C=US", "ST=CA", "L=SanFrancisco", "O=Fort-Funston", "OU=MyOrganizationalUnit",
+/// "CN=do.havedane.net", "name=EasyRSA", "emailAddress=me@myhost.mydomain"]
+/// ```
+fn subject_name(cert: &X509Ref) -> Vec<String> {
+    let mut subject_name = vec![];
+    for entry in cert.subject_name().entries() {
+        if let Ok(obj) = entry.object().nid().short_name() {
+            if let Ok(name) = entry.data().as_utf8() {
+                subject_name.push(format!("{obj}={name}"));
+            }
+        }
+    }
+    subject_name
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_stuffing() {
+        assert_eq!(apply_dot_stuffing(b"foo"), None);
+        assert_eq!(apply_dot_stuffing(b".foo").unwrap(), b"..foo");
+        assert_eq!(apply_dot_stuffing(b"foo\n.bar").unwrap(), b"foo\n..bar");
+        assert_eq!(
+            apply_dot_stuffing(b"foo\n.bar\n..baz\n").unwrap(),
+            b"foo\n..bar\n...baz\n"
+        );
+    }
 
     /*
     #[tokio::test]

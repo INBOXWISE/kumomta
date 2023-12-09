@@ -53,6 +53,7 @@ fedora_deps() {
   fi
   $YUM install -y \
     'clang-devel' \
+    'cmake' \
     'gcc' \
     'gcc-c++' \
     'git' \
@@ -65,6 +66,52 @@ fedora_deps() {
     'rpm-build' \
     'rpm-sign' \
     'telnet'
+}
+
+amazon_deps() {
+  if have_command 'dnf'; then
+    YUM="$SUDO dnf"
+  elif have_command 'yum'; then
+    YUM="$SUDO yum"
+  else
+    echo "No idea what package manager to use, sorry! (perhaps 'dnf' or 'yum' is not in \$PATH?)"
+    return 1
+  fi
+  if ! have_command 'curl' ; then
+    # Some systems have curl-minimal which won't tolerate us
+    # trying to install curl, so only try to install if we
+    # don't have it already
+    $YUM install -y 'curl'
+  fi
+
+  # Amazon Linux 2 has some legacy openssl stuff to workaround
+  case $VERSION in
+    2)
+      $YUM remove 'openssl' || true
+      $YUM install -y 'openssl11-devel'
+      ;;
+    *)
+      $YUM install -y 'openssl-devel'
+      ;;
+  esac
+
+  $YUM install -y \
+    'binutils' \
+    'ca-certificates' \
+    'clang-devel' \
+    'cmake' \
+    'gcc' \
+    'gcc-c++' \
+    'glibc-devel' \
+    'git' \
+    'kernel-devel' \
+    'kernel-headers' \
+    'make' \
+    'pkgconfig' \
+    'python3' \
+    'python3-pip' \
+    'rpm-build' \
+    'rpm-sign'
 }
 
 mariner_deps() {
@@ -89,6 +136,7 @@ mariner_deps() {
     'binutils' \
     'ca-certificates' \
     'clang-devel' \
+    'cmake' \
     'gcc' \
     'gcc-c++' \
     'glibc-devel' \
@@ -125,7 +173,7 @@ suse_deps() {
 
 debian_deps() {
   APT="$SUDO apt-get"
-  $APT install -y \
+  $APT install -y --no-install-recommends \
     'bsdutils' \
     'cmake' \
     'dpkg-dev' \
@@ -276,6 +324,9 @@ case $ID in
   ;;
   mariner)
     mariner_deps
+  ;;
+  amzn)
+    amazon_deps
   ;;
   *)
     echo "Couldn't find OS by ID, found ID: $ID"

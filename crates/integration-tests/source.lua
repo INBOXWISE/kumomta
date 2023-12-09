@@ -6,6 +6,8 @@ local SINK_PORT = tonumber(os.getenv 'KUMOD_SMTP_SINK_PORT')
 local WEBHOOK_PORT = os.getenv 'KUMOD_WEBHOOK_PORT'
 
 kumo.on('init', function()
+  kumo.configure_accounting_db_path(TEST_DIR .. '/accounting.db')
+
   kumo.start_esmtp_listener {
     listen = '127.0.0.1:0',
     relay_hosts = { '0.0.0.0/0' },
@@ -18,11 +20,13 @@ kumo.on('init', function()
   kumo.configure_local_logs {
     log_dir = TEST_DIR .. '/logs',
     max_segment_duration = '1s',
+    headers = { 'X-*', 'Y-*' },
   }
 
   if WEBHOOK_PORT then
     kumo.configure_log_hook {
       name = 'webhook',
+      headers = { 'Subject', 'X-*' },
     }
   end
 
@@ -99,7 +103,7 @@ end)
 kumo.on('get_egress_path_config', function(_domain, _source_name, _site_name)
   -- Allow sending to a sink
   local params = {
-    enable_tls = 'OpportunisticInsecure',
+    enable_tls = os.getenv 'KUMOD_ENABLE_TLS' or 'OpportunisticInsecure',
     smtp_port = SINK_PORT,
     prohibited_hosts = {},
   }

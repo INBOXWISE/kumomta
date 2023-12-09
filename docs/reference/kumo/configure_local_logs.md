@@ -50,6 +50,44 @@ kumo.configure_local_logs {
 }
 ```
 
+## filter_event
+
+{{since('2023.11.28-b5252a41')}}
+
+Optional string. If provided, specifies the name of an event that should
+be triggered to decide whether logs for a given message should be included
+in this instance of local file logging.
+
+The event will be passed the message that is being considered for logging
+purposes.  The goal of the event is to return `true` if logging should
+proceed or `false` otherwise.
+
+You may access the message metadata to make that decision.
+
+```lua
+kumo.on('init', function()
+  -- We only want logs for messages accepted via SMTP to land here
+  kumo.configure_local_logs {
+    log_dir = '/var/log/kumo-logs-smtp',
+    filter_event = 'should_log_to_smtp_logs',
+  }
+
+  -- We want all other logs to land here
+  kumo.configure_local_logs {
+    log_dir = '/var/log/kumo-logs-other',
+    filter_event = 'should_log_to_other',
+  }
+end)
+
+kumo.on('should_log_to_smtp_logs', function(msg)
+  return msg:get_meta 'reception_protocol' == 'ESMTP'
+end)
+
+kumo.on('should_log_to_other', function(msg)
+  return msg:get_meta 'reception_protocol' ~= 'ESMTP'
+end)
+```
+
 ## headers
 
 Specify a list of message headers to include in the logs. The default is
@@ -61,6 +99,11 @@ kumo.configure_local_logs {
   headers = { 'Subject' },
 }
 ```
+
+{{since('dev', indent=True)}}
+    Header names can now use simple wildcard suffixes; if the last character
+    of the header name is `*` then it will match any string with that prefix.
+    For example `"X-*"` will match any header names that start with `"X-"`.
 
 ## log_dir
 
@@ -161,7 +204,20 @@ kumo.configure_local_logs {
 
 The keys of the `per_record` table must correspond to one of the
 record types listed below, or the special `Any` key which can be used
-to match any record type that was not explicitly listed.
+to match any record type that was not explicitly listed.  The values of
+the `per_record` table are `LogRecordParams` have the following fields
+and values:
+
+* `suffix` - a string to append to the generated segment file name.
+  For example, `suffix = '.csv'` will generate names like `20230306-022811.csv`.
+* `log_dir` - specify an alternative log directory for this type
+* `enable` - defaults to `true`. If you set it to `false`, records of this
+  type will not be logged
+* `segment_header` - ({{since('2023.11.28-b5252a41', inline=True)}}) text that will be written
+  out to each newly opened segment file. Useful for emitting eg: a CSV header
+  line.
+* `template` - the template to use to format the log line. Continue reading
+  below for more information.
 
 The [Mini Jinja](https://docs.rs/minijinja/latest/minijinja/) templating engine
 is used to evalute logging templates.  The full supported syntax is [documented
@@ -170,6 +226,23 @@ here](https://docs.rs/minijinja/latest/minijinja/syntax/index.html).
 The JSON log record fields shown in the section below are assigned as template
 variables, so using `{{ id }}` in your log template will be substituted with
 the `id` field from the log record section below.
+
+{{since('2023.11.28-b5252a41', indent=True)}}
+    You may now use `log_record` to reference the entire log record,
+    which is useful if you want to replicate the default json representation
+    of the log record for an individual record type.
+
+    You might wish to use something like the following:
+
+    {% raw %}
+    ```lua
+    per_record = {
+        Feedback = {
+            template = [[{{ log_record | tojson }}]]
+        }
+    }
+    ```
+    {% endraw %}
 
 ## Log Record
 
@@ -285,7 +358,15 @@ The log record is a JSON object with the following shape:
 
     // The node uuid. This identifies the node independently from its
     // IP address or other characteristics present in this log record.
-    "nodeid": "557f3ad4-2c8c-11ee-976e-782d7e12e173"
+    "nodeid": "557f3ad4-2c8c-11ee-976e-782d7e12e173",
+
+    // Information about TLS used for outgoing SMTP, if applicable.
+    // These fields are present in dev builds only:
+    "tls_cipher": "TLS_AES_256_GCM_SHA384",
+    "tls_protocol_version": "TLSv1.3",
+    "tls_peer_subject_name": ["C=US","ST=CA","L=SanFrancisco","O=Fort-Funston",
+                              "OU=MyOrganizationalUnit","CN=do.havedane.net",
+                              "name=EasyRSA","emailAddress=me@myhost.mydomain"]}
 }
 ```
 

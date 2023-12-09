@@ -4,13 +4,19 @@ use crate::ready_queue::{Dispatcher, QueueDispatcher};
 use crate::spool::SpoolManager;
 use anyhow::Context;
 use async_trait::async_trait;
+use config::{load_config, CallbackSignature};
 use dns_resolver::{resolve_a_or_aaaa, ResolvedMxAddresses};
 use kumo_api_types::egress_path::Tls;
 use kumo_log_types::ResolvedAddress;
 use kumo_server_lifecycle::ShutdownSubcription;
 use kumo_server_runtime::{rt_spawn, spawn};
+use message::message::QueueNameComponents;
 use message::Message;
-use rfc5321::{ClientError, EnhancedStatusCode, ForwardPath, Response, ReversePath, SmtpClient};
+use mta_sts::policy::PolicyMode;
+use rfc5321::{
+    ClientError, EnhancedStatusCode, ForwardPath, Response, ReversePath, SmtpClient,
+    TlsInformation, TlsOptions, TlsStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -36,6 +42,7 @@ pub struct SmtpDispatcher {
     client: Option<MetricsWrappedConnection<SmtpClient>>,
     client_address: Option<ResolvedAddress>,
     ehlo_name: String,
+    tls_info: Option<TlsInformation>,
 }
 
 impl SmtpDispatcher {
@@ -161,6 +168,7 @@ impl SmtpDispatcher {
             client: None,
             client_address: None,
             ehlo_name,
+            tls_info: None,
         }))
     }
 }
@@ -222,7 +230,7 @@ impl QueueDispatcher for SmtpDispatcher {
 
         let ehlo_name = self.ehlo_name.to_string();
         let mx_host = address.name.to_string();
-        let enable_tls = dispatcher.path_config.borrow().enable_tls;
+        let mut enable_tls = dispatcher.path_config.borrow().enable_tls;
         let port = dispatcher
             .egress_source
             .remote_port
@@ -280,6 +288,58 @@ impl QueueDispatcher for SmtpDispatcher {
 
         // Use STARTTLS if available.
         let has_tls = pretls_caps.contains_key("STARTTLS");
+
+        let mut dane_tlsa = vec![];
+        let mut mta_sts_eligible = true;
+
+        if dispatcher.path_config.borrow().enable_dane {
+            if let Some(mx) = &dispatcher.mx {
+                match dns_resolver::resolve_dane(&mx.domain_name, port).await {
+                    Ok(tlsa) => {
+                        dane_tlsa = tlsa;
+                        if !dane_tlsa.is_empty() {
+                            enable_tls = Tls::Required;
+                            // Do not use MTA-STS when there are DANE results
+                            mta_sts_eligible = false;
+                        }
+                    }
+                    Err(err) => {
+                        // Do not use MTA-STS when DANE results have been tampered
+                        mta_sts_eligible = false;
+                        tracing::error!("DANE result for {}: {err:#}", mx.domain_name);
+                        // TODO: should we prevent continuing in the clear here? probably
+                    }
+                }
+            }
+        }
+
+        // Figure out MTA-STS policy.
+        if mta_sts_eligible && dispatcher.path_config.borrow().enable_mta_sts {
+            if let Some(mx) = &dispatcher.mx {
+                if let Ok(policy) = mta_sts::get_policy_for_domain(&mx.domain_name).await {
+                    match policy.mode {
+                        PolicyMode::Enforce => {
+                            enable_tls = Tls::Required;
+                            if !policy.mx_name_matches(&address.name) {
+                                anyhow::bail!(
+                                    "MTA-STS policy for {domain} is set to \
+                                     enforce but the current MX candidate \
+                                     {mx_host} does not match the list of allowed \
+                                     hosts. {policy:?}",
+                                    domain = mx.domain_name,
+                                    mx_host = address.name
+                                );
+                            }
+                        }
+                        PolicyMode::Testing => {
+                            enable_tls = Tls::OpportunisticInsecure;
+                        }
+                        PolicyMode::None => {}
+                    }
+                }
+            }
+        }
+
         let tls_enabled = match (enable_tls, has_tls) {
             (Tls::Required | Tls::RequiredInsecure, false) => {
                 anyhow::bail!("tls policy is {enable_tls:?} but STARTTLS is not advertised by {address:?}:{port}",);
@@ -289,19 +349,29 @@ impl QueueDispatcher for SmtpDispatcher {
                 false
             }
             (Tls::OpportunisticInsecure, true) => {
-                let (enabled, label) = if let Some(handshake_error) =
-                    client.starttls(enable_tls.allow_insecure()).await?
+                let (enabled, label) = match client
+                    .starttls(TlsOptions {
+                        insecure: enable_tls.allow_insecure(),
+                        alt_name: None,
+                        dane_tlsa,
+                    })
+                    .await?
                 {
-                    tracing::debug!(
-                        "TLS handshake with {address:?}:{port} failed: \
+                    TlsStatus::FailedHandshake(handshake_error) => {
+                        tracing::debug!(
+                            "TLS handshake with {address:?}:{port} failed: \
                         {handshake_error}, but continuing in clear text because \
                         we are in OpportunisticInsecure mode"
-                    );
-                    // We did not enable TLS
-                    (false, format!("failed: {handshake_error}"))
-                } else {
-                    // TLS is available
-                    (true, "OK".to_string())
+                        );
+                        // We did not enable TLS
+                        (false, format!("failed: {handshake_error}"))
+                    }
+                    TlsStatus::Info(info) => {
+                        // TLS is available
+                        tracing::trace!("TLS: {info:?}");
+                        self.tls_info.replace(info);
+                        (true, "OK".to_string())
+                    }
                 };
                 // Re-EHLO even if we didn't enable TLS, as some implementations
                 // incorrectly roll over failed TLS into the following command,
@@ -316,11 +386,24 @@ impl QueueDispatcher for SmtpDispatcher {
                 enabled
             }
             (Tls::Opportunistic | Tls::Required | Tls::RequiredInsecure, true) => {
-                if let Some(handshake_error) = client.starttls(enable_tls.allow_insecure()).await? {
-                    client.send_command(&rfc5321::Command::Quit).await.ok();
-                    anyhow::bail!(
-                        "TLS handshake with {address:?}:{port} failed: {handshake_error}"
-                    );
+                match client
+                    .starttls(TlsOptions {
+                        insecure: enable_tls.allow_insecure(),
+                        alt_name: None,
+                        dane_tlsa,
+                    })
+                    .await?
+                {
+                    TlsStatus::FailedHandshake(handshake_error) => {
+                        client.send_command(&rfc5321::Command::Quit).await.ok();
+                        anyhow::bail!(
+                            "TLS handshake with {address:?}:{port} failed: {handshake_error}"
+                        );
+                    }
+                    TlsStatus::Info(info) => {
+                        tracing::trace!("TLS: {info:?}");
+                        self.tls_info.replace(info);
+                    }
                 }
                 client
                     .ehlo(&ehlo_name)
@@ -403,32 +486,119 @@ impl QueueDispatcher for SmtpDispatcher {
             .send_mail(sender, recipient, &*data)
             .await
         {
-            Err(ClientError::Rejected(response)) if response.code >= 400 && response.code < 500 => {
-                // Transient failure
-                tracing::debug!(
-                    "failed to send message to {} {:?}: {response:?}",
-                    dispatcher.name,
-                    self.client_address
-                );
-                if let Some(msg) = dispatcher.msg.take() {
-                    log_disposition(LogDisposition {
-                        kind: RecordType::TransientFailure,
-                        msg: msg.clone(),
-                        site: &dispatcher.name,
-                        peer_address: self.client_address.as_ref(),
-                        response,
-                        egress_pool: Some(&dispatcher.egress_pool),
-                        egress_source: Some(&dispatcher.egress_source.name),
-                        relay_disposition: None,
-                        delivery_protocol: Some(&dispatcher.delivery_protocol),
-                    })
+            Err(ClientError::Rejected(mut response)) => {
+                let components = QueueNameComponents::parse(&dispatcher.queue_name);
+                let mut config = load_config().await?;
+
+                let sig = CallbackSignature::<
+                    (String, &str, Option<&str>, Option<&str>, &str),
+                    Option<u16>,
+                >::new("smtp_client_rewrite_delivery_status");
+
+                let rewritten_code: anyhow::Result<Option<u16>> = config
+                    .async_call_callback(
+                        &sig,
+                        (
+                            response.to_single_line(),
+                            components.domain,
+                            components.tenant,
+                            components.campaign,
+                            components
+                                .routing_domain
+                                .as_deref()
+                                .unwrap_or(&components.domain),
+                        ),
+                    )
                     .await;
-                    rt_spawn("requeue message".to_string(), move || {
-                        Ok(async move { Dispatcher::requeue_message(msg, true, None).await })
-                    })
-                    .await?;
+
+                match rewritten_code {
+                    Ok(Some(code)) if code != response.code => {
+                        response.content = format!(
+                            "{} (kumomta: status was rewritten from {} -> {code})",
+                            response.content, response.code
+                        );
+                        response.code = code;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!("smtp_client_rewrite_delivery_status event failed: {err:#}. Preserving original DSN");
+                    }
                 }
-                dispatcher.metrics.inc_transfail();
+
+                if response.code >= 400 && response.code < 500 {
+                    // Transient failure
+                    tracing::debug!(
+                        "failed to send message to {} {:?}: {response:?}",
+                        dispatcher.name,
+                        self.client_address
+                    );
+                    if let Some(msg) = dispatcher.msg.take() {
+                        log_disposition(LogDisposition {
+                            kind: RecordType::TransientFailure,
+                            msg: msg.clone(),
+                            site: &dispatcher.name,
+                            peer_address: self.client_address.as_ref(),
+                            response,
+                            egress_pool: Some(&dispatcher.egress_pool),
+                            egress_source: Some(&dispatcher.egress_source.name),
+                            relay_disposition: None,
+                            delivery_protocol: Some(&dispatcher.delivery_protocol),
+                            tls_info: self.tls_info.as_ref(),
+                        })
+                        .await;
+                        rt_spawn("requeue message".to_string(), move || {
+                            Ok(async move { Dispatcher::requeue_message(msg, true, None).await })
+                        })
+                        .await?;
+                    }
+                    dispatcher.metrics.inc_transfail();
+                } else if response.code >= 200 && response.code < 300 {
+                    tracing::debug!("Delivered OK! {response:?}");
+                    if let Some(msg) = dispatcher.msg.take() {
+                        log_disposition(LogDisposition {
+                            kind: RecordType::Delivery,
+                            msg: msg.clone(),
+                            site: &dispatcher.name,
+                            peer_address: self.client_address.as_ref(),
+                            response,
+                            egress_pool: Some(&dispatcher.egress_pool),
+                            egress_source: Some(&dispatcher.egress_source.name),
+                            relay_disposition: None,
+                            delivery_protocol: Some(&dispatcher.delivery_protocol),
+                            tls_info: self.tls_info.as_ref(),
+                        })
+                        .await;
+                        spawn("remove from spool", async move {
+                            SpoolManager::remove_from_spool(*msg.id()).await
+                        })?;
+                    }
+                    dispatcher.metrics.inc_delivered();
+                } else {
+                    dispatcher.metrics.inc_fail();
+                    tracing::debug!(
+                        "failed to send message to {} {:?}: {response:?}",
+                        dispatcher.name,
+                        self.client_address
+                    );
+                    if let Some(msg) = dispatcher.msg.take() {
+                        log_disposition(LogDisposition {
+                            kind: RecordType::Bounce,
+                            msg: msg.clone(),
+                            site: &dispatcher.name,
+                            peer_address: self.client_address.as_ref(),
+                            response,
+                            egress_pool: Some(&dispatcher.egress_pool),
+                            egress_source: Some(&dispatcher.egress_source.name),
+                            relay_disposition: None,
+                            delivery_protocol: Some(&dispatcher.delivery_protocol),
+                            tls_info: self.tls_info.as_ref(),
+                        })
+                        .await;
+                        spawn("remove from spool", async move {
+                            SpoolManager::remove_from_spool(*msg.id()).await
+                        })?;
+                    }
+                }
             }
             Err(ClientError::TimeOutRequest { command, duration }) => {
                 // Transient failure
@@ -458,6 +628,7 @@ impl QueueDispatcher for SmtpDispatcher {
                         egress_source: Some(&dispatcher.egress_source.name),
                         relay_disposition: None,
                         delivery_protocol: Some(&dispatcher.delivery_protocol),
+                        tls_info: self.tls_info.as_ref(),
                     })
                     .await;
                     rt_spawn("requeue message".to_string(), move || {
@@ -498,6 +669,7 @@ impl QueueDispatcher for SmtpDispatcher {
                         egress_source: Some(&dispatcher.egress_source.name),
                         relay_disposition: None,
                         delivery_protocol: Some(&dispatcher.delivery_protocol),
+                        tls_info: self.tls_info.as_ref(),
                     })
                     .await;
                     rt_spawn("requeue message".to_string(), move || {
@@ -508,31 +680,6 @@ impl QueueDispatcher for SmtpDispatcher {
                 dispatcher.metrics.inc_transfail();
                 // Move on to the next host
                 anyhow::bail!("{reason}");
-            }
-            Err(ClientError::Rejected(response)) => {
-                dispatcher.metrics.inc_fail();
-                tracing::debug!(
-                    "failed to send message to {} {:?}: {response:?}",
-                    dispatcher.name,
-                    self.client_address
-                );
-                if let Some(msg) = dispatcher.msg.take() {
-                    log_disposition(LogDisposition {
-                        kind: RecordType::Bounce,
-                        msg: msg.clone(),
-                        site: &dispatcher.name,
-                        peer_address: self.client_address.as_ref(),
-                        response,
-                        egress_pool: Some(&dispatcher.egress_pool),
-                        egress_source: Some(&dispatcher.egress_source.name),
-                        relay_disposition: None,
-                        delivery_protocol: Some(&dispatcher.delivery_protocol),
-                    })
-                    .await;
-                    spawn("remove from spool", async move {
-                        SpoolManager::remove_from_spool(*msg.id()).await
-                    })?;
-                }
             }
             Err(err) => {
                 // Transient failure; continue with another host
@@ -556,6 +703,7 @@ impl QueueDispatcher for SmtpDispatcher {
                         egress_source: Some(&dispatcher.egress_source.name),
                         relay_disposition: None,
                         delivery_protocol: Some(&dispatcher.delivery_protocol),
+                        tls_info: self.tls_info.as_ref(),
                     })
                     .await;
                     spawn("remove from spool", async move {

@@ -4,15 +4,16 @@ use anyhow::{anyhow, Context};
 use async_channel::{Receiver, Sender};
 use bounce_classify::{BounceClass, BounceClassifier, BounceClassifierBuilder};
 use chrono::Utc;
-use config::{any_err, from_lua_value, get_or_create_module, load_config};
+use config::{any_err, from_lua_value, get_or_create_module, load_config, CallbackSignature};
 use kumo_log_types::rfc3464::ReportAction;
 pub use kumo_log_types::*;
 use kumo_server_runtime::rt_spawn_non_blocking;
 use message::{EnvelopeAddress, Message};
 use minijinja::{Environment, Template};
+use minijinja_contrib::add_to_environment;
 use mlua::{Lua, Value as LuaValue};
 use once_cell::sync::{Lazy, OnceCell};
-use rfc5321::{EnhancedStatusCode, Response};
+use rfc5321::{EnhancedStatusCode, Response, TlsInformation};
 use serde::Deserialize;
 use serde_json::Value;
 use spool::SpoolId;
@@ -31,6 +32,8 @@ use zstd::stream::write::Encoder;
 
 static LOGGER: Lazy<Mutex<Vec<Arc<Logger>>>> = Lazy::new(|| Mutex::new(vec![]));
 static CLASSIFY: OnceCell<BounceClassifier> = OnceCell::new();
+pub static SHOULD_ENQ_LOG_RECORD_SIG: Lazy<CallbackSignature<(Message, String), bool>> =
+    Lazy::new(|| CallbackSignature::new_with_multiple("should_enqueue_log_record"));
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +85,10 @@ pub struct LogRecordParams {
     /// minijinja template
     #[serde(default)]
     pub template: Option<String>,
+
+    /// Written to the start of each newly created log file segment
+    #[serde(default)]
+    pub segment_header: String,
 }
 
 fn default_true() -> bool {
@@ -148,6 +155,12 @@ pub struct LogFileParams {
 
     #[serde(default)]
     pub per_record: HashMap<RecordType, LogRecordParams>,
+
+    /// The name of an event which can be used to filter
+    /// out log records which should not be logged to this
+    /// log file
+    #[serde(default)]
+    pub filter_event: Option<String>,
 }
 
 impl LogFileParams {
@@ -174,6 +187,7 @@ pub struct Logger {
     meta: Vec<String>,
     headers: Vec<String>,
     enabled: HashMap<RecordType, bool>,
+    filter_event: Option<String>,
 }
 
 impl Logger {
@@ -183,6 +197,7 @@ impl Logger {
 
     pub fn init_hook(params: LogHookParams) -> anyhow::Result<()> {
         let mut template_engine = Environment::new();
+        add_to_environment(&mut template_engine);
 
         for (kind, per_rec) in &params.per_record {
             if let Some(template_source) = &per_rec.template {
@@ -229,6 +244,7 @@ impl Logger {
             meta,
             headers,
             enabled,
+            filter_event: None,
         };
 
         LOGGER.lock().unwrap().push(Arc::new(logger));
@@ -237,6 +253,7 @@ impl Logger {
 
     pub fn init(params: LogFileParams) -> anyhow::Result<()> {
         let mut template_engine = Environment::new();
+        add_to_environment(&mut template_engine);
 
         for (kind, per_rec) in &params.per_record {
             if let Some(template_source) = &per_rec.template {
@@ -261,6 +278,8 @@ impl Logger {
         let headers = params.headers.clone();
         let meta = params.meta.clone();
         let (sender, receiver) = async_channel::bounded(params.back_pressure);
+        let filter_event = params.filter_event.clone();
+
         let thread = std::thread::Builder::new()
             .name("logger".to_string())
             .spawn(move || {
@@ -287,6 +306,7 @@ impl Logger {
             meta,
             headers,
             enabled,
+            filter_event,
         };
 
         LOGGER.lock().unwrap().push(Arc::new(logger));
@@ -335,30 +355,58 @@ impl Logger {
         if !self.headers.is_empty() {
             msg.load_data_if_needed().await.ok();
 
-            let mut all_headers: HashMap<String, Vec<Value>> = HashMap::new();
+            let mut all_headers: HashMap<String, (String, Vec<Value>)> = HashMap::new();
             for (name, value) in msg.get_all_headers().unwrap_or_else(|_| vec![]) {
                 all_headers
                     .entry(name.to_ascii_lowercase())
-                    .or_default()
+                    .or_insert_with(|| (name.to_string(), vec![]))
+                    .1
                     .push(value.into());
             }
 
-            for name in &self.headers {
+            fn capture_header(
+                headers: &mut HashMap<String, Value>,
+                name: &str,
+                all_headers: &mut HashMap<String, (String, Vec<Value>)>,
+            ) {
                 match all_headers.remove(&name.to_ascii_lowercase()) {
-                    Some(mut values) if values.len() == 1 => {
-                        headers.insert(name.to_string(), values.remove(0));
+                    Some((orig_name, mut values)) if values.len() == 1 => {
+                        headers.insert(orig_name.to_string(), values.remove(0));
                     }
-                    Some(values) => {
-                        headers.insert(name.to_string(), Value::Array(values));
+                    Some((orig_name, values)) => {
+                        headers.insert(orig_name.to_string(), Value::Array(values));
                     }
                     None => {}
+                }
+            }
+
+            for name in &self.headers {
+                if name.ends_with('*') {
+                    let pattern = name[..name.len() - 1].to_ascii_lowercase();
+                    let matching_names: Vec<String> = all_headers
+                        .keys()
+                        .filter_map(|candidate| {
+                            if candidate.to_ascii_lowercase().starts_with(&pattern) {
+                                Some(candidate.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for name in matching_names {
+                        capture_header(&mut headers, &name, &mut all_headers);
+                    }
+                } else {
+                    capture_header(&mut headers, name, &mut all_headers);
                 }
             }
         }
 
         for name in &self.meta {
             if let Ok(value) = msg.get_meta(name) {
-                meta.insert(name.to_string(), value);
+                if !value.is_null() {
+                    meta.insert(name.to_string(), value);
+                }
             }
         }
 
@@ -376,6 +424,7 @@ pub struct LogDisposition<'a> {
     pub egress_source: Option<&'a str>,
     pub relay_disposition: Option<RelayDisposition>,
     pub delivery_protocol: Option<&'a str>,
+    pub tls_info: Option<&'a TlsInformation>,
 }
 
 pub async fn log_disposition(args: LogDisposition<'_>) {
@@ -389,6 +438,7 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
         egress_source,
         relay_disposition,
         delivery_protocol,
+        tls_info,
     } = args;
 
     let loggers = Logger::get_loggers();
@@ -418,8 +468,59 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
         if !logger.record_is_enabled(kind) {
             continue;
         }
+        if let Some(name) = &logger.filter_event {
+            match load_config().await {
+                Ok(mut lua_config) => {
+                    let log_sig = CallbackSignature::<Message, bool>::new(name.clone());
+
+                    let enqueue: bool =
+                        match lua_config.async_call_callback(&log_sig, msg.clone()).await {
+                            Ok(b) => b,
+                            Err(err) => {
+                                tracing::error!(
+                                    "error while calling {name} event for log filter: {err:#}"
+                                );
+                                false
+                            }
+                        };
+                    if !enqueue {
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "failed to load lua config while attempting to \
+                         call {name} event for log filter: {err:#}"
+                    );
+                    continue;
+                }
+            };
+        }
+
+        match kind {
+            RecordType::Reception => {
+                crate::accounting::account_reception(
+                    &reception_protocol.as_deref().unwrap_or("unknown"),
+                );
+            }
+            RecordType::Delivery => {
+                crate::accounting::account_delivery(
+                    &delivery_protocol.as_deref().unwrap_or("unknown"),
+                );
+            }
+            _ => {}
+        };
 
         let (headers, meta) = logger.extract_fields(&msg).await;
+
+        let mut tls_cipher = None;
+        let mut tls_protocol_version = None;
+        let mut tls_peer_subject_name = None;
+        if let Some(info) = tls_info {
+            tls_cipher.replace(info.cipher.clone());
+            tls_protocol_version.replace(info.protocol_version.clone());
+            tls_peer_subject_name.replace(info.subject_name.clone());
+        }
 
         let record = JsonLogRecord {
             kind,
@@ -444,13 +545,16 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
             num_attempts: msg.get_num_attempts(),
             egress_pool: egress_pool.map(|s| s.to_string()),
             egress_source: egress_source.map(|s| s.to_string()),
-            bounce_classification: BounceClass::Uncategorized,
+            bounce_classification: BounceClass::default(),
             feedback_report: feedback_report.clone(),
             headers,
             meta,
             delivery_protocol: delivery_protocol.map(|s| s.to_string()),
             reception_protocol: reception_protocol.clone(),
             nodeid,
+            tls_cipher,
+            tls_protocol_version,
+            tls_peer_subject_name,
         };
         if let Err(err) = logger.log(record).await {
             tracing::error!("failed to log: {err:#}");
@@ -525,13 +629,16 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
                             num_attempts: 0,
                             egress_pool: None,
                             egress_source: None,
-                            bounce_classification: BounceClass::Uncategorized,
+                            bounce_classification: BounceClass::default(),
                             feedback_report: None,
                             headers: HashMap::new(),
                             meta: HashMap::new(),
                             delivery_protocol: None,
                             reception_protocol: reception_protocol.clone(),
                             nodeid,
+                            tls_cipher: None,
+                            tls_protocol_version: None,
+                            tls_peer_subject_name: None,
                         };
 
                         if let Err(err) = logger.log(record).await {
@@ -636,6 +743,8 @@ impl LogHookState {
         }
 
         let mut record_text = Vec::new();
+        self.template_engine
+            .add_global("log_record", minijinja::Value::from_serializable(&record));
 
         if let Some(template) =
             Self::resolve_template(&self.params, &self.template_engine, record.kind)
@@ -667,8 +776,9 @@ impl LogHookState {
         rt_spawn_non_blocking("should_enqueue_log_record".to_string(), move || {
             Ok(async move {
                 let mut lua_config = load_config().await?;
+
                 let enqueue: bool = lua_config
-                    .async_call_callback("should_enqueue_log_record", (msg.clone(), name))
+                    .async_call_callback(&SHOULD_ENQ_LOG_RECORD_SIG, (msg.clone(), name))
                     .await?;
 
                 if enqueue {
@@ -857,25 +967,39 @@ impl LogThreadState {
                 .open(&name)
                 .with_context(|| format!("open log file {name:?}"))?;
 
-            self.file_map.insert(
-                file_key.clone(),
-                OpenedFile {
-                    file: Encoder::new(f, self.params.compression_level)
-                        .context("set up zstd encoder")?,
-                    name,
-                    written: 0,
-                    expires: self
-                        .params
-                        .max_segment_duration
-                        .map(|duration| Instant::now() + duration),
-                },
-            );
+            let mut file = OpenedFile {
+                file: Encoder::new(f, self.params.compression_level)
+                    .context("set up zstd encoder")?,
+                name,
+                written: 0,
+                expires: self
+                    .params
+                    .max_segment_duration
+                    .map(|duration| Instant::now() + duration),
+            };
+
+            if let Some(per_rec) = self.per_record(record.kind) {
+                if !per_rec.segment_header.is_empty() {
+                    file.file
+                        .write_all(per_rec.segment_header.as_bytes())
+                        .with_context(|| {
+                            format!(
+                                "writing segment header to newly opened segment file {}",
+                                file.name.display()
+                            )
+                        })?;
+                }
+            }
+
+            self.file_map.insert(file_key.clone(), file);
         }
 
         let mut need_rotate = false;
 
         if let Some(file) = self.file_map.get_mut(&file_key) {
             let mut record_text = Vec::new();
+            self.template_engine
+                .add_global("log_record", minijinja::Value::from_serializable(&record));
 
             if let Some(template) =
                 Self::resolve_template(&self.params, &self.template_engine, record.kind)

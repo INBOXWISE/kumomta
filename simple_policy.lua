@@ -4,6 +4,8 @@ local shaping = require 'policy-extras.shaping'
 
 -- Called on startup to initialize the system
 kumo.on('init', function()
+  kumo.configure_accounting_db_path '/tmp/acct.db'
+
   -- Define a listener.
   -- Can be used multiple times with different parameters to
   -- define multiple listeners!
@@ -125,6 +127,13 @@ end)
 -- Called once the body has been received.
 -- For multi-recipient mail, this is called for each recipient.
 kumo.on('smtp_server_message_received', function(msg)
+  local verify = msg:dkim_verify()
+  print('dkim', kumo.json_encode_pretty(verify))
+  msg:add_authentication_results(msg:get_meta 'hostname', verify)
+  print(msg:get_first_named_header_value 'Authentication-Results')
+  print(msg:get_data())
+
+  --[[
   local failed = msg:check_fix_conformance(
     -- check for and reject messages with these issues:
     'MISSING_COLON_VALUE',
@@ -134,6 +143,7 @@ kumo.on('smtp_server_message_received', function(msg)
   if failed then
     kumo.reject(552, string.format('5.6.0 %s', failed))
   end
+  ]]
 
   -- print('id', msg:id(), 'sender', tostring(msg:sender()))
   -- print(msg:get_meta 'authn_id')
@@ -194,7 +204,7 @@ kumo.on(
 -- Not the final form of this API, but this is currently how
 -- we retrieve configuration used for managing a queue.
 kumo.on('get_queue_config', function(domain, tenant, campaign)
-  print('get_queue_config', domain, tenant, campaign)
+  print('get_queue_config:1', domain, tenant, campaign)
   if domain == 'maildir.example.com' then
     -- Store this domain into a maildir, rather than attempting
     -- to deliver via SMTP
@@ -204,7 +214,10 @@ kumo.on('get_queue_config', function(domain, tenant, campaign)
       },
     }
   end
+end)
 
+kumo.on('get_queue_config', function(domain, tenant, campaign)
+  print('get_queue_config:2', domain, tenant, campaign)
   return kumo.make_queue_config {
     -- Age out messages after being in the queue for 2 minutes
     -- max_age = "2 minutes"
@@ -229,13 +242,13 @@ end
 -- with user and pass fields
 function sqlite_auth_check(user, password)
   local sqlite = require 'sqlite'
-  local db = sqlite.open '/path/to/auth.db'
+  local db = sqlite.open '/tmp/auth.db'
   local result = db:execute(
     'select user from auth where user=? and pass=?',
     user,
     password
   )
-  return #result == 1
+  return result[1] == user
 end
 
 -- Use this to lookup and confirm a user/password credential

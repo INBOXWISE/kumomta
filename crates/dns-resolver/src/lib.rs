@@ -1,20 +1,39 @@
+use crate::resolver::Resolver;
+use arc_swap::ArcSwap;
+use hickory_resolver::error::ResolveResult;
+pub use hickory_resolver::proto::rr::rdata::tlsa::TLSA;
+use hickory_resolver::proto::rr::RecordType;
+use hickory_resolver::Name;
 use kumo_log_types::ResolvedAddress;
 use lruttl::LruCacheWithTtl;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
-use tokio::sync::RwLock;
-use trust_dns_resolver::error::{ResolveErrorKind, ResolveResult};
-use trust_dns_resolver::{Name, TokioAsyncResolver};
+
+pub mod resolver;
 
 lazy_static::lazy_static! {
-    static ref RESOLVER: RwLock<TokioAsyncResolver> = RwLock::new(TokioAsyncResolver::tokio_from_system_conf().unwrap());
+    static ref RESOLVER: ArcSwap<Resolver> = ArcSwap::from_pointee(default_resolver());
     static ref MX_CACHE: StdMutex<LruCacheWithTtl<Name, Arc<MailExchanger>>> = StdMutex::new(LruCacheWithTtl::new(64 * 1024));
     static ref IPV4_CACHE: StdMutex<LruCacheWithTtl<Name, Arc<Vec<IpAddr>>>> = StdMutex::new(LruCacheWithTtl::new(1024));
     static ref IPV6_CACHE: StdMutex<LruCacheWithTtl<Name, Arc<Vec<IpAddr>>>> = StdMutex::new(LruCacheWithTtl::new(1024));
     static ref IP_CACHE: StdMutex<LruCacheWithTtl<Name, Arc<Vec<IpAddr>>>> = StdMutex::new(LruCacheWithTtl::new(1024));
+}
+
+#[cfg(feature = "default-unbound")]
+fn default_resolver() -> Resolver {
+    // This resolves directly against the root
+    let context = libunbound::Context::new().unwrap();
+    // and enables DNSSEC
+    context.add_builtin_trust_anchors().unwrap();
+    Resolver::Unbound(context.into_async().unwrap())
+}
+
+#[cfg(not(feature = "default-unbound"))]
+fn default_resolver() -> Resolver {
+    Resolver::Tokio(hickory_resolver::TokioAsyncResolver::tokio_from_system_conf().unwrap())
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -22,8 +41,10 @@ pub struct MailExchanger {
     pub domain_name: String,
     pub hosts: Vec<String>,
     pub site_name: String,
-    pub by_pref: HashMap<u16, Vec<String>>,
+    pub by_pref: BTreeMap<u16, Vec<String>>,
     pub is_domain_literal: bool,
+    /// DNSSEC verified
+    pub is_secure: bool,
 }
 
 pub fn fully_qualify(domain_name: &str) -> ResolveResult<Name> {
@@ -35,8 +56,55 @@ pub fn fully_qualify(domain_name: &str) -> ResolveResult<Name> {
     Ok(name)
 }
 
-pub async fn reconfigure_resolver(resolver: TokioAsyncResolver) {
-    *RESOLVER.write().await = resolver;
+pub fn reconfigure_resolver(resolver: Resolver) {
+    RESOLVER.store(Arc::new(resolver));
+}
+
+pub fn get_resolver() -> Arc<Resolver> {
+    RESOLVER.load_full()
+}
+
+/// Resolves TLSA records for a destination name and port according to
+/// <https://datatracker.ietf.org/doc/html/rfc6698#appendix-B.2>
+pub async fn resolve_dane(hostname: &str, port: u16) -> anyhow::Result<Vec<TLSA>> {
+    let name = fully_qualify(&format!("_{port}._tcp.{hostname}"))?;
+    let answer = RESOLVER.load().resolve(name, RecordType::TLSA).await?;
+    tracing::info!("resolve_dane {hostname}:{port} TLSA answer is: {answer:?}");
+
+    if answer.bogus {
+        // Bogus records are either tampered with, or due to misconfiguration
+        // of the local resolver
+        anyhow::bail!(
+            "DANE result for {hostname}:{port} unusable because: {}",
+            answer
+                .why_bogus
+                .as_deref()
+                .unwrap_or("DNSSEC validation failed")
+        );
+    }
+
+    let mut result = vec![];
+    // We ignore TLSA records unless they are validated; in other words,
+    // we'll return an empty list (without raising an error) if the resolver
+    // is not configured to verify DNSSEC
+    if answer.secure {
+        for r in &answer.records {
+            if let Some(tlsa) = r.as_tlsa() {
+                result.push(tlsa.clone());
+            }
+        }
+        // DNS results are unordered. For the sake of tests,
+        // sort these records.
+        // Unfortunately, the TLSA type is nor Ord so we
+        // convert to string and order by that, which is a bit
+        // wasteful but the cardinality of TLSA records is
+        // generally low
+        result.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    }
+
+    tracing::info!("resolve_dane {hostname}:{port} result is: {result:?}");
+
+    Ok(result)
 }
 
 pub async fn resolve_a_or_aaaa(domain_name: &str) -> anyhow::Result<Vec<ResolvedAddress>> {
@@ -116,7 +184,7 @@ impl MailExchanger {
             if let Some(v6_literal) = literal.strip_prefix("ipv6:") {
                 match v6_literal.parse::<Ipv6Addr>() {
                     Ok(addr) => {
-                        let mut by_pref = HashMap::new();
+                        let mut by_pref = BTreeMap::new();
                         by_pref.insert(1, vec![addr.to_string()]);
                         return Ok(Arc::new(Self {
                             domain_name: domain_name.to_string(),
@@ -124,6 +192,7 @@ impl MailExchanger {
                             site_name: addr.to_string(),
                             by_pref,
                             is_domain_literal: true,
+                            is_secure: false,
                         }));
                     }
                     Err(err) => {
@@ -137,7 +206,7 @@ impl MailExchanger {
             // IPv6 address, so this is non-conforming behavior.
             match literal.parse::<IpAddr>() {
                 Ok(addr) => {
-                    let mut by_pref = HashMap::new();
+                    let mut by_pref = BTreeMap::new();
                     by_pref.insert(1, vec![addr.to_string()]);
                     return Ok(Arc::new(Self {
                         domain_name: domain_name.to_string(),
@@ -145,6 +214,7 @@ impl MailExchanger {
                         site_name: addr.to_string(),
                         by_pref,
                         is_domain_literal: true,
+                        is_secure: false,
                     }));
                 }
                 Err(err) => {
@@ -160,18 +230,6 @@ impl MailExchanger {
 
         let (by_pref, expires) = match lookup_mx_record(&name_fq).await {
             Ok((by_pref, expires)) => (by_pref, expires),
-            Err(err) if matches!(err.kind(), ResolveErrorKind::NoRecordsFound { .. }) => {
-                match ip_lookup(domain_name).await {
-                    Ok((_addr, expires)) => (
-                        vec![ByPreference {
-                            hosts: vec![name_fq.to_string()],
-                            pref: 1,
-                        }],
-                        expires,
-                    ),
-                    Err(err) => anyhow::bail!("{err:#}"),
-                }
-            }
             Err(err) => anyhow::bail!("MX lookup for {domain_name} failed: {err:#}"),
         };
 
@@ -181,6 +239,8 @@ impl MailExchanger {
                 hosts.push(host.to_string());
             }
         }
+
+        let is_secure = by_pref.iter().all(|p| p.is_secure);
 
         let by_pref = by_pref
             .into_iter()
@@ -194,6 +254,7 @@ impl MailExchanger {
             site_name,
             by_pref,
             is_domain_literal: false,
+            is_secure,
         };
 
         let mx = Arc::new(mx);
@@ -251,26 +312,35 @@ pub enum ResolvedMxAddresses {
 struct ByPreference {
     hosts: Vec<String>,
     pref: u16,
+    is_secure: bool,
 }
 
-async fn lookup_mx_record(domain_name: &Name) -> ResolveResult<(Vec<ByPreference>, Instant)> {
-    let mx_lookup = RESOLVER.read().await.mx_lookup(domain_name.clone()).await?;
-    let mx_records = mx_lookup.as_lookup().records();
+async fn lookup_mx_record(domain_name: &Name) -> anyhow::Result<(Vec<ByPreference>, Instant)> {
+    let mx_lookup = RESOLVER
+        .load()
+        .resolve(domain_name.clone(), RecordType::MX)
+        .await?;
+    let mx_records = mx_lookup.records;
 
     if mx_records.is_empty() {
+        if mx_lookup.nxdomain {
+            anyhow::bail!("NXDOMAIN");
+        }
+
         return Ok((
             vec![ByPreference {
                 hosts: vec![domain_name.to_string()],
                 pref: 1,
+                is_secure: false,
             }],
-            mx_lookup.valid_until(),
+            mx_lookup.expires,
         ));
     }
 
     let mut records: Vec<ByPreference> = Vec::with_capacity(mx_records.len());
 
     for mx_record in mx_records {
-        if let Some(mx) = mx_record.data().and_then(|r| r.as_mx()) {
+        if let Some(mx) = mx_record.as_mx() {
             let pref = mx.preference();
             let host = mx.exchange().to_lowercase().to_string();
 
@@ -280,6 +350,7 @@ async fn lookup_mx_record(domain_name: &Name) -> ResolveResult<(Vec<ByPreference
                 records.push(ByPreference {
                     hosts: vec![host],
                     pref,
+                    is_secure: mx_lookup.secure,
                 });
             }
         }
@@ -294,10 +365,10 @@ async fn lookup_mx_record(domain_name: &Name) -> ResolveResult<(Vec<ByPreference
         mx.hosts.sort();
     }
 
-    Ok((records, mx_lookup.valid_until()))
+    Ok((records, mx_lookup.expires))
 }
 
-pub async fn ip_lookup(key: &str) -> ResolveResult<(Arc<Vec<IpAddr>>, Instant)> {
+pub async fn ip_lookup(key: &str) -> anyhow::Result<(Arc<Vec<IpAddr>>, Instant)> {
     let key_fq = fully_qualify(key)?;
     if let Some(value) = IP_CACHE.lock().unwrap().get_with_expiry(&key_fq) {
         return Ok(value);
@@ -345,21 +416,20 @@ pub async fn ip_lookup(key: &str) -> ResolveResult<(Arc<Vec<IpAddr>>, Instant)> 
     Ok((addr, exp))
 }
 
-pub async fn ipv4_lookup(key: &str) -> ResolveResult<(Arc<Vec<IpAddr>>, Instant)> {
+pub async fn ipv4_lookup(key: &str) -> anyhow::Result<(Arc<Vec<IpAddr>>, Instant)> {
     let key_fq = fully_qualify(key)?;
     if let Some(value) = IPV4_CACHE.lock().unwrap().get_with_expiry(&key_fq) {
         return Ok(value);
     }
 
-    let ipv4_lookup = RESOLVER.read().await.ipv4_lookup(key_fq.clone()).await?;
-    let ips = ipv4_lookup
-        .as_lookup()
-        .record_iter()
-        .filter_map(|r| Some(r.data()?.as_a()?.0.into()))
-        .collect::<Vec<_>>();
+    let answer = RESOLVER
+        .load()
+        .resolve(key_fq.clone(), RecordType::A)
+        .await?;
+    let ips = answer.as_addr();
 
     let ips = Arc::new(ips);
-    let expires = ipv4_lookup.valid_until();
+    let expires = answer.expires;
     IPV4_CACHE
         .lock()
         .unwrap()
@@ -367,21 +437,20 @@ pub async fn ipv4_lookup(key: &str) -> ResolveResult<(Arc<Vec<IpAddr>>, Instant)
     Ok((ips, expires))
 }
 
-pub async fn ipv6_lookup(key: &str) -> ResolveResult<(Arc<Vec<IpAddr>>, Instant)> {
+pub async fn ipv6_lookup(key: &str) -> anyhow::Result<(Arc<Vec<IpAddr>>, Instant)> {
     let key_fq = fully_qualify(key)?;
     if let Some(value) = IPV6_CACHE.lock().unwrap().get_with_expiry(&key_fq) {
         return Ok(value);
     }
 
-    let ipv6_lookup = RESOLVER.read().await.ipv6_lookup(key_fq.clone()).await?;
-    let ips = ipv6_lookup
-        .as_lookup()
-        .record_iter()
-        .filter_map(|r| Some(r.data()?.as_aaaa()?.0.into()))
-        .collect::<Vec<_>>();
+    let answer = RESOLVER
+        .load()
+        .resolve(key_fq.clone(), RecordType::AAAA)
+        .await?;
+    let ips = answer.as_addr();
 
     let ips = Arc::new(ips);
-    let expires = ipv6_lookup.valid_until();
+    let expires = answer.expires;
     IPV6_CACHE
         .lock()
         .unwrap()
@@ -480,6 +549,7 @@ MailExchanger {
         ],
     },
     is_domain_literal: true,
+    is_secure: false,
 }
 "#
         );
@@ -513,6 +583,7 @@ MailExchanger {
         ],
     },
     is_domain_literal: true,
+    is_secure: false,
 }
 "#
         );
@@ -546,6 +617,7 @@ MailExchanger {
         ],
     },
     is_domain_literal: true,
+    is_secure: false,
 }
 "#
         );
@@ -619,6 +691,241 @@ Addresses(
                 "example-com.mail.protection.outlook.com.",
             ]),
             "(mx-biz|example-com).mail.(am0|protection).(yahoodns|outlook).(net|com)".to_string()
+        );
+    }
+
+    #[cfg(feature = "live-dns-tests")]
+    #[tokio::test]
+    async fn lookup_gmail_mx() {
+        let gmail = MailExchanger::resolve("gmail.com").await.unwrap();
+        k9::snapshot!(
+            gmail,
+            r#"
+MailExchanger {
+    domain_name: "gmail.com.",
+    hosts: [
+        "gmail-smtp-in.l.google.com.",
+        "alt1.gmail-smtp-in.l.google.com.",
+        "alt2.gmail-smtp-in.l.google.com.",
+        "alt3.gmail-smtp-in.l.google.com.",
+        "alt4.gmail-smtp-in.l.google.com.",
+    ],
+    site_name: "(alt1|alt2|alt3|alt4)?.gmail-smtp-in.l.google.com",
+    by_pref: {
+        5: [
+            "gmail-smtp-in.l.google.com.",
+        ],
+        10: [
+            "alt1.gmail-smtp-in.l.google.com.",
+        ],
+        20: [
+            "alt2.gmail-smtp-in.l.google.com.",
+        ],
+        30: [
+            "alt3.gmail-smtp-in.l.google.com.",
+        ],
+        40: [
+            "alt4.gmail-smtp-in.l.google.com.",
+        ],
+    },
+    is_domain_literal: false,
+    is_secure: false,
+}
+"#
+        );
+    }
+
+    #[cfg(feature = "live-dns-tests")]
+    #[tokio::test]
+    async fn lookup_bogus_aasland() {
+        let err = MailExchanger::resolve("not-mairs.aasland.com")
+            .await
+            .unwrap_err();
+        k9::snapshot!(err, "MX lookup for not-mairs.aasland.com failed: NXDOMAIN");
+    }
+
+    #[cfg(feature = "live-dns-tests")]
+    #[tokio::test]
+    async fn lookup_example_com() {
+        // Has a NULL MX record
+        let mx = MailExchanger::resolve("example.com").await.unwrap();
+        k9::snapshot!(
+            mx,
+            r#"
+MailExchanger {
+    domain_name: "example.com.",
+    hosts: [
+        ".",
+    ],
+    site_name: "",
+    by_pref: {
+        0: [
+            ".",
+        ],
+    },
+    is_domain_literal: false,
+    is_secure: true,
+}
+"#
+        );
+    }
+
+    #[cfg(feature = "live-dns-tests")]
+    #[tokio::test]
+    async fn lookup_have_dane() {
+        let mx = MailExchanger::resolve("do.havedane.net").await.unwrap();
+        k9::snapshot!(
+            mx,
+            r#"
+MailExchanger {
+    domain_name: "do.havedane.net.",
+    hosts: [
+        "do.havedane.net.",
+    ],
+    site_name: "do.havedane.net",
+    by_pref: {
+        10: [
+            "do.havedane.net.",
+        ],
+    },
+    is_domain_literal: false,
+    is_secure: true,
+}
+"#
+        );
+    }
+
+    #[cfg(feature = "live-dns-tests")]
+    #[tokio::test]
+    async fn tlsa_have_dane() {
+        let tlsa = resolve_dane("do.havedane.net", 25).await.unwrap();
+        k9::snapshot!(
+            tlsa,
+            "
+[
+    TLSA {
+        cert_usage: TrustAnchor,
+        selector: Spki,
+        matching: Sha256,
+        cert_data: [
+            39,
+            182,
+            148,
+            181,
+            29,
+            31,
+            239,
+            136,
+            133,
+            55,
+            42,
+            207,
+            179,
+            145,
+            147,
+            117,
+            151,
+            34,
+            183,
+            54,
+            176,
+            66,
+            104,
+            100,
+            220,
+            28,
+            121,
+            208,
+            101,
+            31,
+            239,
+            115,
+        ],
+    },
+    TLSA {
+        cert_usage: DomainIssued,
+        selector: Spki,
+        matching: Sha256,
+        cert_data: [
+            85,
+            58,
+            207,
+            136,
+            249,
+            238,
+            24,
+            204,
+            170,
+            230,
+            53,
+            202,
+            84,
+            15,
+            50,
+            203,
+            132,
+            172,
+            167,
+            124,
+            71,
+            145,
+            102,
+            130,
+            188,
+            181,
+            66,
+            213,
+            29,
+            170,
+            135,
+            31,
+        ],
+    },
+]
+"
+        );
+    }
+
+    #[cfg(feature = "live-dns-tests")]
+    #[tokio::test]
+    async fn mx_lookup_www_example_com() {
+        // Has no MX, should fall back to A lookup
+        let mx = MailExchanger::resolve("www.example.com").await.unwrap();
+        k9::snapshot!(
+            mx,
+            r#"
+MailExchanger {
+    domain_name: "www.example.com.",
+    hosts: [
+        "www.example.com.",
+    ],
+    site_name: "www.example.com",
+    by_pref: {
+        1: [
+            "www.example.com.",
+        ],
+    },
+    is_domain_literal: false,
+    is_secure: false,
+}
+"#
+        );
+    }
+
+    #[cfg(feature = "live-dns-tests")]
+    #[tokio::test]
+    async fn txt_lookup_gmail() {
+        let answer = get_resolver()
+            .resolve("_mta-sts.gmail.com", RecordType::TXT)
+            .await
+            .unwrap();
+        k9::snapshot!(
+            answer.as_txt(),
+            r#"
+[
+    "v=STSv1; id=20190429T010101;",
+]
+"#
         );
     }
 }

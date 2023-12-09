@@ -10,6 +10,10 @@ use mlua::{Lua, Value};
 pub fn register(lua: &Lua) -> anyhow::Result<()> {
     let kumo_mod = get_or_create_module(lua, "kumo")?;
 
+    crate::queue::GET_Q_CONFIG_SIG.register();
+    crate::logging::SHOULD_ENQ_LOG_RECORD_SIG.register();
+    crate::PRE_INIT_SIG.register();
+
     kumo_mod.set(
         "start_http_listener",
         lua.create_async_function(|lua, params: Value| async move {
@@ -81,6 +85,14 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
             let pool: EgressPool = from_lua_value(lua, params)?;
             // pool.register().map_err(any_err)
             Ok(pool)
+        })?,
+    )?;
+
+    kumo_mod.set(
+        "configure_accounting_db_path",
+        lua.create_function(|_lua, file_name: String| {
+            *crate::accounting::DB_PATH.lock().unwrap() = file_name;
+            Ok(())
         })?,
     )?;
 

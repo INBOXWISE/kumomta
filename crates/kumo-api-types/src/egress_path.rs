@@ -50,6 +50,12 @@ pub struct EgressPathConfig {
     #[serde(default)]
     pub enable_tls: Tls,
 
+    #[serde(default = "EgressPathConfig::default_enable_mta_sts")]
+    pub enable_mta_sts: bool,
+
+    #[serde(default = "EgressPathConfig::default_enable_dane")]
+    pub enable_dane: bool,
+
     #[serde(flatten)]
     pub client_timeouts: SmtpClientTimeouts,
 
@@ -100,6 +106,8 @@ impl Default for EgressPathConfig {
         Self {
             connection_limit: Self::default_connection_limit(),
             enable_tls: Tls::default(),
+            enable_mta_sts: Self::default_enable_mta_sts(),
+            enable_dane: Self::default_enable_dane(),
             max_ready: Self::default_max_ready(),
             consecutive_connection_failures_before_delay:
                 Self::default_consecutive_connection_failures_before_delay(),
@@ -122,6 +130,14 @@ impl Default for EgressPathConfig {
 impl EgressPathConfig {
     fn default_connection_limit() -> usize {
         32
+    }
+
+    fn default_enable_mta_sts() -> bool {
+        true
+    }
+
+    fn default_enable_dane() -> bool {
+        false
     }
 
     fn default_max_ready() -> usize {

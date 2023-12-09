@@ -10,11 +10,14 @@ fn main() {
 #[cfg(test)]
 mod test {
     use super::kumod::*;
+    use anyhow::Context;
     use k9::assert_equal;
     use kumo_api_types::SuspendV1Response;
+    use kumo_log_types::RecordType;
     use kumo_log_types::RecordType::{Bounce, Delivery, Reception, TransientFailure};
     use mailparsing::DecodedBody;
     use rfc5321::*;
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     #[tokio::test]
@@ -49,6 +52,16 @@ DeliverySummary {
         TransientFailure: 1,
     },
     sink_counts: {},
+}
+"
+        );
+
+        k9::snapshot!(
+            daemon.source.accounting_stats()?,
+            "
+AccountingStats {
+    received: 1,
+    delivered: 0,
 }
 "
         );
@@ -107,6 +120,15 @@ DeliverySummary {
         TransientFailure: 1,
     },
     sink_counts: {},
+}
+"
+        );
+        k9::snapshot!(
+            daemon.source.accounting_stats()?,
+            "
+AccountingStats {
+    received: 1,
+    delivered: 0,
 }
 "
         );
@@ -195,6 +217,15 @@ DeliverySummary {
 }
 "
         );
+        k9::snapshot!(
+            daemon.source.accounting_stats()?,
+            "
+AccountingStats {
+    received: 2,
+    delivered: 1,
+}
+"
+        );
         Ok(())
     }
 
@@ -243,6 +274,15 @@ DeliverySummary {
         Reception: 1,
     },
     sink_counts: {},
+}
+"
+        );
+        k9::snapshot!(
+            daemon.source.accounting_stats()?,
+            "
+AccountingStats {
+    received: 1,
+    delivered: 0,
 }
 "
         );
@@ -326,6 +366,15 @@ DeliverySummary {
 }
 "
         );
+        k9::snapshot!(
+            daemon.source.accounting_stats()?,
+            "
+AccountingStats {
+    received: 2,
+    delivered: 1,
+}
+"
+        );
         Ok(())
     }
 
@@ -361,6 +410,15 @@ DeliverySummary {
         Bounce: 1,
     },
     sink_counts: {},
+}
+"
+        );
+        k9::snapshot!(
+            daemon.source.accounting_stats()?,
+            "
+AccountingStats {
+    received: 1,
+    delivered: 0,
 }
 "
         );
@@ -400,10 +458,12 @@ DeliverySummary {
     /// into the maildir at the other end with the same content
     #[tokio::test]
     async fn end_to_end() -> anyhow::Result<()> {
-        let mut daemon = DaemonWithMaildir::start().await?;
+        let mut daemon = DaemonWithMaildir::start()
+            .await
+            .context("DaemonWithMaildir::start")?;
 
         eprintln!("sending message");
-        let mut client = daemon.smtp_client().await?;
+        let mut client = daemon.smtp_client().await.context("make smtp_client")?;
 
         let body = generate_message_text(1024, 78);
         let response = MailGenParams {
@@ -411,7 +471,8 @@ DeliverySummary {
             ..Default::default()
         }
         .send(&mut client)
-        .await?;
+        .await
+        .context("send message")?;
         eprintln!("{response:?}");
         anyhow::ensure!(response.code == 250);
 
@@ -419,10 +480,127 @@ DeliverySummary {
             .wait_for_maildir_count(1, Duration::from_secs(10))
             .await;
 
-        daemon.stop_both().await?;
+        daemon.stop_both().await.context("stop_both")?;
         println!("Stopped!");
 
-        let delivery_summary = daemon.dump_logs()?;
+        daemon.source.check_for_x_and_y_headers_in_logs()?;
+
+        let delivery_summary = daemon.dump_logs().context("dump_logs")?;
+        k9::snapshot!(
+            delivery_summary,
+            "
+DeliverySummary {
+    source_counts: {
+        Reception: 1,
+        Delivery: 1,
+    },
+    sink_counts: {
+        Reception: 1,
+        Delivery: 1,
+    },
+}
+"
+        );
+        k9::snapshot!(
+            daemon.source.accounting_stats()?,
+            "
+AccountingStats {
+    received: 1,
+    delivered: 1,
+}
+"
+        );
+
+        let mut messages = daemon.extract_maildir_messages()?;
+
+        assert_equal!(messages.len(), 1);
+        let parsed = messages[0].parsed()?;
+        println!("headers: {:?}", parsed.headers());
+
+        assert!(parsed.headers().get_first("Received").is_some());
+        assert!(parsed.headers().get_first("X-KumoRef").is_some());
+
+        // These two headers are added to all MailGenParams generated mail
+        assert!(parsed.headers().get_first("X-Test1").is_some());
+        assert!(parsed.headers().get_first("X-Another").is_some());
+
+        k9::snapshot!(
+            parsed.headers().from().unwrap(),
+            r#"
+Some(
+    MailboxList(
+        [
+            Mailbox {
+                name: None,
+                address: AddrSpec {
+                    local_part: "sender",
+                    domain: "example.com",
+                },
+            },
+        ],
+    ),
+)
+"#
+        );
+        k9::snapshot!(
+            parsed.headers().to().unwrap(),
+            r#"
+Some(
+    AddressList(
+        [
+            Mailbox(
+                Mailbox {
+                    name: None,
+                    address: AddrSpec {
+                        local_part: "recip",
+                        domain: "example.com",
+                    },
+                },
+            ),
+        ],
+    ),
+)
+"#
+        );
+        assert_equal!(
+            parsed.headers().subject().unwrap().unwrap(),
+            "Hello! This is a test"
+        );
+        assert_equal!(parsed.body().unwrap(), DecodedBody::Text(body.into()));
+
+        Ok(())
+    }
+
+    /// Verify that what we send in transits through and is delivered
+    /// into the maildir at the other end with the same content
+    #[tokio::test]
+    async fn end_to_end_stuffed() -> anyhow::Result<()> {
+        let mut daemon = DaemonWithMaildir::start()
+            .await
+            .context("DaemonWithMaildir::start")?;
+
+        eprintln!("sending message");
+        let mut client = daemon.smtp_client().await.context("make smtp_client")?;
+
+        let body = ".Stuffing required\r\nFor me\r\n";
+        let response = MailGenParams {
+            body: Some(&body),
+            ..Default::default()
+        }
+        .send(&mut client)
+        .await
+        .context("send message")?;
+        eprintln!("{response:?}");
+        anyhow::ensure!(response.code == 250);
+
+        daemon
+            .wait_for_maildir_count(1, Duration::from_secs(10))
+            .await;
+
+        daemon.stop_both().await.context("stop_both")?;
+        println!("Stopped!");
+
+        let delivery_summary = daemon.dump_logs().context("dump_logs")?;
         k9::snapshot!(
             delivery_summary,
             "
@@ -647,6 +825,27 @@ Ok(
 "
         );
 
+        let mut logged_headers = vec![];
+        for record in daemon.webhook.return_logs() {
+            if record.kind == RecordType::Reception {
+                let ordered_headers: BTreeMap<_, _> = record.headers.into_iter().collect();
+                logged_headers.push(ordered_headers);
+            }
+        }
+        k9::snapshot!(
+            logged_headers,
+            r#"
+[
+    {
+        "Subject": String("Hello! This is a test"),
+        "X-Another": String("Another"),
+        "X-KumoRef": String("eyJfQF8iOiJcXF8vIiwicmVjaXBpZW50IjoicmVjaXBAZXhhbXBsZS5jb20ifQ=="),
+        "X-Test1": String("Test1"),
+    },
+]
+"#
+        );
+
         let mut messages = daemon.with_maildir.extract_maildir_messages()?;
 
         assert_equal!(messages.len(), 1);
@@ -699,6 +898,53 @@ Some(
         );
         assert_equal!(parsed.body().unwrap(), DecodedBody::Text(body.into()));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tls_opportunistic_fail() -> anyhow::Result<()> {
+        let mut daemon = DaemonWithMaildir::start_with_env(vec![
+            // The default is OpportunisticInsecure; tighten it up a bit
+            // so that we fail to deliver to the sink, and verify
+            // the result of that attempt below
+            ("KUMOD_ENABLE_TLS", "Opportunistic"),
+        ])
+        .await?;
+
+        let mut client = daemon.smtp_client().await?;
+
+        let body = generate_message_text(1024, 78);
+        let response = MailGenParams {
+            body: Some(&body),
+            ..Default::default()
+        }
+        .send(&mut client)
+        .await?;
+        anyhow::ensure!(response.code == 250);
+
+        daemon
+            .wait_for_source_summary(
+                |summary| summary.get(&TransientFailure).copied().unwrap_or(0) > 0,
+                Duration::from_secs(5),
+            )
+            .await;
+
+        daemon.stop_both().await?;
+        println!("Stopped!");
+
+        let delivery_summary = daemon.dump_logs()?;
+        k9::snapshot!(
+            delivery_summary,
+            "
+DeliverySummary {
+    source_counts: {
+        Reception: 1,
+        TransientFailure: 1,
+    },
+    sink_counts: {},
+}
+"
+        );
         Ok(())
     }
 }

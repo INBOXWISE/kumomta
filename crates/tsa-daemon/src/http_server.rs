@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use config::CallbackSignature;
 use dns_resolver::MailExchanger;
 use kumo_api_types::shaping::{Action, EgressPathConfigValue, Rule, Shaping, Trigger};
 use kumo_log_types::*;
 use kumo_server_common::http_server::auth::TrustedIpRequired;
-use kumo_server_common::http_server::AppError;
+use kumo_server_common::http_server::{AppError, RouterAndDocs};
 use kumo_server_runtime::rt_spawn;
 use once_cell::sync::Lazy;
 use rfc5321::ForwardPath;
@@ -16,6 +17,7 @@ use sqlite::{Connection, ConnectionWithFullMutex};
 use std::hash::Hash;
 use std::sync::Mutex;
 use toml_edit::{value, Value as TomlValue};
+use utoipa::OpenApi;
 
 pub static DB_PATH: Lazy<Mutex<String>> =
     Lazy::new(|| Mutex::new("/var/spool/kumomta/tsa.db".to_string()));
@@ -54,10 +56,17 @@ CREATE TABLE IF NOT EXISTS config (
     Ok(db)
 }
 
-pub fn make_router() -> Router {
-    Router::new()
-        .route("/publish_log_v1", post(publish_log_v1))
-        .route("/get_config_v1/shaping.toml", get(get_config_v1))
+#[derive(OpenApi)]
+#[openapi(info(title = "tsa-daemon",), paths(), components())]
+struct ApiDoc;
+
+pub fn make_router() -> RouterAndDocs {
+    RouterAndDocs {
+        router: Router::new()
+            .route("/publish_log_v1", post(publish_log_v1))
+            .route("/get_config_v1/shaping.toml", get(get_config_v1)),
+        docs: ApiDoc::openapi(),
+    }
 }
 
 fn create_config(
@@ -168,7 +177,13 @@ async fn publish_log_v1_impl(record: JsonLogRecord) -> Result<(), AppError> {
     // of the changed code, it is safer for us to re-derive it for ourselves
     // so that we don't end up in a situation where we can't match any rollup
     // rules.
-    let mx = MailExchanger::resolve(&domain).await?;
+    let mx = match MailExchanger::resolve(&domain).await {
+        Ok(mx) => mx,
+        Err(err) => {
+            tracing::trace!("domain {domain} failed to resolve, ignoring record. {err:#}");
+            return Ok(());
+        }
+    };
 
     // Track events/outcomes by site.
     // At the time of writing, `record.site` looks like `source->site_name`
@@ -179,8 +194,9 @@ async fn publish_log_v1_impl(record: JsonLogRecord) -> Result<(), AppError> {
     let store_key = format!("{source}->{}", mx.site_name);
 
     let mut config = config::load_config().await?;
+    let sig = CallbackSignature::<(), Shaping>::new("tsa_load_shaping_data");
     let shaping: Shaping = config
-        .async_call_callback_non_default("tsa_load_shaping_data", ())
+        .async_call_callback_non_default(&sig, ())
         .await
         .context("in tsa_load_shaping_data event")?;
 
@@ -203,6 +219,8 @@ async fn publish_log_v1_impl(record: JsonLogRecord) -> Result<(), AppError> {
                 count >= spec.limit
             }
         };
+
+        tracing::trace!("match={m:?} triggered={triggered} for {record:?}");
 
         // To enact the action, we need to generate (or update) a row
         // in the db with its effects and its expiry
@@ -285,8 +303,9 @@ async fn publish_log_v1(
     rt_spawn("process record".to_string(), move || {
         Ok(async move { tx.send(publish_log_v1_impl(record).await) })
     })
-    .await?;
-    rx.await?
+    .await
+    .context("while processing /publish_log_v1")?;
+    rx.await.context("while processing /publish_log_v1")?
 }
 
 fn json_to_toml_value(item_value: &JsonValue) -> anyhow::Result<TomlValue> {

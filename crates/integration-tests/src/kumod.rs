@@ -5,6 +5,7 @@ use maildir::{MailEntry, Maildir};
 use mailparsing::MessageBuilder;
 use nix::unistd::{Uid, User};
 use rfc5321::{ForwardPath, Response, ReversePath, SmtpClient, SmtpClientTimeouts};
+use sqlite::{Connection, State};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::process::Stdio;
@@ -94,6 +95,8 @@ impl MailGenParams<'_> {
         message.set_to(recip);
         message.set_subject(self.subject.unwrap_or("Hello! This is a test"));
         message.text_plain(body);
+        message.prepend("X-Test1", "Test1");
+        message.prepend("X-Another", "Another");
         Ok(message.build()?.to_message_string())
     }
 }
@@ -115,7 +118,7 @@ impl DaemonWithMaildir {
     }
 
     pub async fn start_with_env(env: Vec<(&str, &str)>) -> anyhow::Result<Self> {
-        let sink = KumoDaemon::spawn_maildir().await?;
+        let sink = KumoDaemon::spawn_maildir().await.context("spawn_maildir")?;
         let smtp = sink.listener("smtp");
 
         let mut env: Vec<(String, String)> = env
@@ -129,7 +132,8 @@ impl DaemonWithMaildir {
             policy_file: "source.lua".to_string(),
             env,
         })
-        .await?;
+        .await
+        .context("KumoDaemon::spawn")?;
 
         Ok(Self { source, sink })
     }
@@ -280,20 +284,25 @@ impl KumoDaemon {
 
         let dir = tempfile::tempdir().context("make temp dir")?;
 
-        let user = User::from_uid(Uid::current())?
+        let user = User::from_uid(Uid::current())
+            .context("determine current uid")?
             .ok_or_else(|| anyhow::anyhow!("couldn't resolve myself"))?;
 
-        let mut child = Command::new(&path)
-            .args(["--policy", &args.policy_file, "--user", &user.name])
+        let mut cmd = Command::new(&path);
+        cmd.args(["--policy", &args.policy_file, "--user", &user.name])
             .env("KUMOD_LOG", "kumod=trace,kumo_server_common=info")
             .env("KUMOD_TEST_DIR", dir.path())
             .envs(args.env.iter().cloned())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+
+        let cmd_label = format!("{cmd:?}");
+
+        let mut child = cmd
             .spawn()
-            .with_context(|| format!("spawning {}", path.display()))?;
+            .with_context(|| format!("spawning {cmd_label}"))?;
 
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
 
@@ -333,7 +342,7 @@ impl KumoDaemon {
             let mut line = String::new();
             stderr.read_line(&mut line).await?;
             if line.is_empty() {
-                anyhow::bail!("Unexpected EOF");
+                anyhow::bail!("Unexpected EOF while reading output from {cmd_label}");
             }
             eprintln!("{}", line.trim());
 
@@ -403,6 +412,30 @@ impl KumoDaemon {
         Maildir::from(self.dir.path().join("maildir"))
     }
 
+    pub fn check_for_x_and_y_headers_in_logs(&self) -> anyhow::Result<()> {
+        let dir = self.dir.path().join("logs");
+
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                let f = std::fs::File::open(entry.path())?;
+                let data = zstd::stream::decode_all(f)?;
+                let text = String::from_utf8(data)?;
+                eprintln!("{text}");
+
+                for line in text.lines() {
+                    let record: JsonLogRecord = serde_json::from_str(&line)?;
+                    if record.kind == RecordType::Reception {
+                        assert!(record.headers.contains_key("X-Test1"));
+                        assert!(record.headers.contains_key("X-Another"));
+                        assert!(!record.headers.contains_key("y-something"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn dump_logs(&self) -> anyhow::Result<BTreeMap<RecordType, usize>> {
         let dir = self.dir.path().join("logs");
         let mut counts = BTreeMap::new();
@@ -437,6 +470,34 @@ impl KumoDaemon {
             _ = tokio::time::sleep(timeout) => false,
         }
     }
+
+    pub fn accounting_stats(&self) -> anyhow::Result<AccountingStats> {
+        let path = self.dir.path().join("accounting.db");
+
+        let db = Connection::open_with_full_mutex(&path)
+            .with_context(|| format!("opening accounting database {path:?}"))?;
+
+        let mut stmt = db
+            .prepare("select sum(received) as r, sum(delivered) as d from accounting")
+            .with_context(|| format!("prepare query against {path:?}"))?;
+        if let Ok(State::Row) = stmt.next() {
+            let received = stmt.read::<i64, _>("r")?;
+            let delivered = stmt.read::<i64, _>("d")?;
+
+            return Ok(AccountingStats {
+                received: received as usize,
+                delivered: delivered as usize,
+            });
+        }
+
+        anyhow::bail!("unexpected state from accounting db");
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AccountingStats {
+    pub received: usize,
+    pub delivered: usize,
 }
 
 pub struct DaemonWithMaildirAndWebHook {

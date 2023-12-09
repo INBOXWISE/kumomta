@@ -7,7 +7,7 @@ use crate::spool::SpoolManager;
 use anyhow::{anyhow, Context};
 use chrono::Utc;
 use cidr_map::{AnyIpCidr, CidrSet};
-use config::{any_err, load_config, LuaConfig};
+use config::{any_err, load_config, CallbackSignature, LuaConfig};
 use data_loader::KeySource;
 use kumo_log_types::ResolvedAddress;
 use kumo_server_lifecycle::{Activity, ShutdownSubcription};
@@ -17,7 +17,7 @@ use mailparsing::ConformanceDisposition;
 use memchr::memmem::Finder;
 use message::{EnvelopeAddress, Message};
 use mlua::prelude::LuaUserData;
-use mlua::{LuaSerdeExt, ToLuaMulti, UserData, UserDataMethods};
+use mlua::{FromLuaMulti, LuaSerdeExt, ToLuaMulti, UserData, UserDataMethods};
 use once_cell::sync::{Lazy, OnceCell};
 use prometheus::IntGauge;
 use rfc5321::{AsyncReadAndWrite, BoxedAsyncReadAndWrite, Command, Response};
@@ -262,6 +262,8 @@ impl EsmtpListenerParams {
                 }
                 result = listener.accept() => {
                     let (socket, peer_address) = result?;
+                    // No need for Nagle with SMTP request/response
+                    socket.set_nodelay(true)?;
                     let my_address = socket.local_addr()?;
                     let params = self.clone();
                     rt_spawn(
@@ -402,6 +404,7 @@ impl SmtpServer {
         meta.set_meta("reception_protocol", "ESMTP");
         meta.set_meta("received_via", my_address.to_string());
         meta.set_meta("received_from", peer_address.to_string());
+        meta.set_meta("hostname", params.hostname.to_string());
 
         let mut server = SmtpServer {
             socket: Some(socket),
@@ -468,10 +471,14 @@ impl SmtpServer {
             return Ok(opt_dom);
         }
 
+        let sig =
+            CallbackSignature::<(String, String, ConnectionMetaData), Option<EsmtpDomain>>::new(
+                "get_listener_domain",
+            );
         let value: anyhow::Result<Option<EsmtpDomain>> = self
             .config
             .async_call_callback_non_default_opt(
-                "get_listener_domain",
+                &sig,
                 (key.domain.clone(), key.listener.clone(), self.meta.clone()),
             )
             .await;
@@ -796,16 +803,19 @@ impl SmtpServer {
         }
     }
 
-    pub async fn call_callback<'lua, R, S: AsRef<str>, A: ToLuaMulti<'lua> + Clone>(
+    pub async fn call_callback<
+        'lua,
+        R: for<'a> FromLuaMulti<'a> + Default + serde::Serialize,
+        S: Into<std::borrow::Cow<'static, str>>,
+        A: for<'a> ToLuaMulti<'a> + Clone,
+    >(
         &'lua mut self,
         name: S,
         args: A,
-    ) -> anyhow::Result<Result<R, RejectError>>
-    where
-        R: mlua::FromLuaMulti<'lua> + Default + serde::Serialize,
-    {
-        let name = name.as_ref();
-        match self.config.async_call_callback(name, args).await {
+    ) -> anyhow::Result<Result<R, RejectError>> {
+        let name = name.into();
+        let sig = CallbackSignature::<A, R>::new(name.clone());
+        match self.config.async_call_callback(&sig, args).await {
             Ok(r) => {
                 SmtpServerTraceManager::submit(|| SmtpServerTraceEvent {
                     conn_meta: self.meta.clone_inner(),
@@ -972,7 +982,7 @@ impl SmtpServer {
                     if !self.tls_active {
                         self.write_response(
                             524,
-                            "5.7.11 AUTH {sasl_mech} requires an encrypted channel",
+                            format!("5.7.11 AUTH {sasl_mech} requires an encrypted channel"),
                         )
                         .await?;
                         continue;
@@ -981,6 +991,7 @@ impl SmtpServer {
                     let response = if let Some(r) = initial_response {
                         r
                     } else {
+                        self.write_response(334, " ").await?;
                         match self.read_line(Some(16384)).await? {
                             ReadLine::Disconnected => return Ok(()),
                             ReadLine::Line(line) => line,
@@ -1477,6 +1488,7 @@ impl SmtpServer {
                 egress_source: None,
                 relay_disposition: None,
                 delivery_protocol: None,
+                tls_info: None, // TODO: populate with peer info
             })
             .await;
             if queue_name != "null" {

@@ -3,16 +3,15 @@
 ## Breaking Changes
 
 ## Other Changes and Enhancements
-* New RFC-conformance options are available to control server behavior
-  when receiving messages that are non-conformant:
-     * [invalid_line_endings](../reference/kumo/start_esmtp_listener.md#invalid_line_endings) #22 #23
-     * [line_length_hard_limit](../reference/kumo/start_esmtp_listener.md#line_length_hard_limit) #25
-     * [message:check_fix_conformance](../reference/message/check_fix_conformance.md) #17 #24 #26
-* HTTP injection API will now parse and re-encode the message content to ensure
-  that it has appropriate transfer encoding applied when `content` is set to a
-  string, rather than using the builder variant of the API.
+
+* You may now use arbitrary bounce classification labels when defining bounce classification rules. #98
+* queue helper: Added `setup_with_options` method that allows skipping the registration of the
+  `get_queue_config` event handler. This helps when building a more complex configuration
+  policy, such as using the rollup helper. Thanks to @cai-n! #101
+* You may now use simple suffix based wildcards like `X-*` to match header
+  names to capture in log records. See
+  [kumo.configure_local_logs](../reference/kumo/configure_local_logs.md). #74
 
 ## Fixes
-* HTTP injection API did not expand templating in `From`, `Reply-To` or
-  `Subject` headers unless they were set in the additional headers object
-* Allow optional spaces after the colon in `MAIL FROM:` and `RCPT TO:`. #76
+
+* MTA-STS policy may fail to match due to trailing periods in mx host names

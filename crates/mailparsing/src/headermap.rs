@@ -1,5 +1,6 @@
 use crate::{
-    AddressList, Header, Mailbox, MailboxList, MessageID, MimeParameters, Result, SharedString,
+    AddressList, AuthenticationResults, Header, Mailbox, MailboxList, MessageID, MimeParameters,
+    Result, SharedString,
 };
 use chrono::{DateTime, FixedOffset, TimeZone};
 use paste::paste;
@@ -92,6 +93,11 @@ impl<'a> HeaderMap<'a> {
         Self { headers }
     }
 
+    pub fn prepend<V: Into<SharedString<'a>>>(&mut self, name: &str, v: V) {
+        self.headers
+            .insert(0, Header::new_unstructured(name.to_string(), v));
+    }
+
     pub fn get_first(&'a self, name: &str) -> Option<&Header<'a>> {
         self.iter_named(name).next()
     }
@@ -173,5 +179,12 @@ impl<'a> HeaderMap<'a> {
         "Content-Type",
         MimeParameters,
         as_content_type
+    );
+
+    accessor!(
+        authentication_results,
+        "Authentication-Results",
+        AuthenticationResults,
+        as_authentication_results
     );
 }

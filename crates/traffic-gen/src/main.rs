@@ -181,7 +181,13 @@ impl Opt {
         let caps = client.ehlo(&self.pick_a_domain()).await?;
 
         if self.starttls && caps.contains_key("STARTTLS") {
-            client.starttls(true).await?;
+            client
+                .starttls(TlsOptions {
+                    insecure: true,
+                    alt_name: None,
+                    dane_tlsa: vec![],
+                })
+                .await?;
         }
 
         Ok(client)

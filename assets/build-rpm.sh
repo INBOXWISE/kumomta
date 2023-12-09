@@ -6,7 +6,7 @@ HERE=$(pwd)
 
 # If not specified, build the rpm as `kumomta-dev`.
 # When we're building from a tag (REF_TYPE is set to tag) we set 'RPM_NAME=kumomta'
-[[ "${REF_TYPE}" == "tag" ]] && RPM_NAME=kumomta
+[[ "${REF_TYPE}" == "tag" || "${CI_PIPELINE_EVENT}" == "tag" ]] && RPM_NAME=kumomta
 RPM_NAME=${RPM_NAME:-kumomta-dev}
 
 CONFLICTS=kumomta
@@ -99,6 +99,7 @@ install -Dm644 ./assets/kumo-tsa-daemon.service -t %{buildroot}/usr/lib/systemd/
 /opt/kumomta/sbin/traffic-gen
 /opt/kumomta/sbin/tsa-daemon
 /opt/kumomta/sbin/validate-shaping
+/opt/kumomta/sbin/accounting.sh
 /opt/kumomta/share/bounce_classifier/*.toml
 /opt/kumomta/share/minimal-init.lua
 /opt/kumomta/share/minimal-tsa_init.lua

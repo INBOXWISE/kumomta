@@ -13,10 +13,50 @@ use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::str::FromStr;
 use std::sync::Arc;
+use tower_http::trace::TraceLayer;
+use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+use utoipa::OpenApi;
+use utoipa_rapidoc::RapiDoc;
+// Avoid referencing api types as crate::name in the utoipa macros,
+// otherwise it generates namespaced names in the openapi.json, which
+// in turn require annotating each and every struct with the namespace
+// in order for the document to be valid.
+use kumo_api_types::*;
 
 pub mod auth;
 
 use auth::*;
+
+#[derive(OpenApi)]
+#[openapi(
+    info(license(name = "Apache-2.0")),
+    paths(set_diagnostic_log_filter_v1),
+    // Indicate that all paths can accept http basic auth.
+    // the "basic_auth" name corresponds with the scheme
+    // defined by the OptionalAuth addon defined below
+    security(
+        ("basic_auth" = [""])
+    ),
+    components(schemas(SetDiagnosticFilterRequest)),
+    modifiers(&OptionalAuth),
+)]
+struct ApiDoc;
+
+struct OptionalAuth;
+
+impl utoipa::Modify for OptionalAuth {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi
+            .components
+            .as_mut()
+            .expect("always set because we always have components above");
+        // Define basic_auth as http basic auth
+        components.add_security_scheme(
+            "basic_auth",
+            SecurityScheme::Http(Http::new(HttpAuthScheme::Basic)),
+        );
+    }
+}
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +77,27 @@ pub struct HttpListenerParams {
 
     #[serde(default = "HttpListenerParams::default_trusted_hosts")]
     pub trusted_hosts: CidrSet,
+}
+
+pub struct RouterAndDocs {
+    pub router: Router,
+    pub docs: utoipa::openapi::OpenApi,
+}
+
+impl RouterAndDocs {
+    pub fn make_docs(&self) -> utoipa::openapi::OpenApi {
+        let mut api_docs = ApiDoc::openapi();
+        api_docs.info.title = self.docs.info.title.to_string();
+        api_docs.merge(self.docs.clone());
+        api_docs.info.version = version_info::kumo_version().to_string();
+        api_docs.info.license = Some(
+            utoipa::openapi::LicenseBuilder::new()
+                .name("Apache-2.0")
+                .build(),
+        );
+
+        api_docs
+    }
 }
 
 #[derive(Clone)]
@@ -80,8 +141,12 @@ impl HttpListenerParams {
     // So, for now at least, we'll have to manually verify if
     // a request should proceed based on the results from the lifecycle
     // module.
-    pub async fn start(self, router: Router) -> anyhow::Result<()> {
-        let app = router
+    pub async fn start(self, router_and_docs: RouterAndDocs) -> anyhow::Result<()> {
+        let api_docs = router_and_docs.make_docs();
+
+        let app = router_and_docs
+            .router
+            .merge(RapiDoc::with_openapi("/api-docs/openapi.json", api_docs).path("/rapidoc"))
             .route(
                 "/api/admin/set_diagnostic_log_filter/v1",
                 post(set_diagnostic_log_filter_v1),
@@ -95,7 +160,8 @@ impl HttpListenerParams {
                     trusted_hosts: Arc::new(self.trusted_hosts.clone()),
                 },
                 auth_middleware,
-            ));
+            ))
+            .layer(TraceLayer::new_for_http());
         let socket = TcpListener::bind(&self.listen)
             .with_context(|| format!("listen on {}", self.listen))?;
         let addr = socket.local_addr()?;
@@ -255,10 +321,21 @@ async fn report_metrics_json(_: TrustedIpRequired) -> Result<Json<serde_json::Va
     Ok(Json(Value::Object(result)))
 }
 
+/// Changes the diagnostic log filter dynamically.
+/// See <https://docs.kumomta.com/reference/kumo/set_diagnostic_log_filter/>
+/// for more information on diagnostic log filters.
+#[utoipa::path(
+    post,
+    tag="logging",
+    path="/api/admin/set_diagnostic_log_filter/v1",
+    responses(
+        (status = 200, description = "Diagnostic level set successfully")
+    ),
+)]
 async fn set_diagnostic_log_filter_v1(
     _: TrustedIpRequired,
     // Note: Json<> must be last in the param list
-    Json(request): Json<kumo_api_types::SetDiagnosticFilterRequest>,
+    Json(request): Json<SetDiagnosticFilterRequest>,
 ) -> Result<(), AppError> {
     set_diagnostic_log_filter(&request.filter)?;
     Ok(())

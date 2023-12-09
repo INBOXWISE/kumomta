@@ -36,13 +36,19 @@ sudo apt-get -y upgrade
 
 * Install basic testing and support tools like firewalld tree telnet git bind (or bind9) bind-utils (or bind9-utils)
 
+Note that installing a caching name server is absolutely critical when you are using a high performance mail engine.  Please do yourself a favour and install bind (or some other caching name server) and test it now.
+```bash
+sudo apt install bind9 -y
+sudo systemctl start named
+```
+
 * Turn off services that can interfere, particularly postfix and qpidd
 
 ```bash
-systemctl disable postfix
-systemctl stop postfix
-systemctl disable qpidd
-systemctl stop qpidd
+sudo systemctl disable postfix
+sudo systemctl stop postfix
+sudo systemctl disable qpidd
+sudo systemctl stop qpidd
 ```
 
 * Tune the use of memory and file access for best performance. In the sysctl settings, boosting fs.file-max up to 65535 and also setting tcp_tw_reuse = 1 will help performance.  Make other adjustments as needed to make maximum use of RAM, file, and network resources.

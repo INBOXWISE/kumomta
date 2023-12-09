@@ -1,5 +1,7 @@
 # Configuration Concepts
 
+<iframe width="560" height="315" src="https://www.youtube.com/embed/2jO2isq_YLg?si=6anX9R9RgH2aU2px" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+
 KumoMTA uses Lua in place of a more traditional formatted configuration file.
 
 Lua is a surprisingly powerful configuration language, allowing you to either statically define configuration or dynamically build it by pulling from multiple data sources.
@@ -90,7 +92,7 @@ That said, any modification to the policy script itself is subject to caching of
 An example:
 
 ```lua
-kumo.on('get_queue_config', function(domain, tenant, campaign)
+kumo.on('get_queue_config', function(domain, tenant, campaign, routing_domain)
   return kumo.make_queue_config {
     egress_pool = tenant,
   }
